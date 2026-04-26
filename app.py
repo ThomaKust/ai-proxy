@@ -237,8 +237,7 @@ def ask_model(api_key, model, messages, temperature, max_tokens, timeout):
         "messages": messages,
         "temperature": temperature,
         "top_p": 0.9,
-        "max_tokens": max_tokens,
-        "stream": False
+        "max_tokens": max_tokens
     }
 
     try:
@@ -246,7 +245,7 @@ def ask_model(api_key, model, messages, temperature, max_tokens, timeout):
             URL,
             headers=headers,
             json=payload,
-            timeout=(10, timeout)
+            timeout=(10, 25)  # connect=10s, read=25s
         )
 
         if resp.status_code != 200:
