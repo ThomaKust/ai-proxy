@@ -27,6 +27,7 @@ def load_nvidia_keys():
     ):
         value = os.getenv(env_name, "").strip()
         if value:
+            value = value.removeprefix("Bearer ").strip()
             keys.append(value)
 
     unique_keys = []
@@ -124,7 +125,7 @@ def cleanup_expired_leases(now=None):
         now = time.time()
 
     expired_clients = []
-    for client_id, lease in CLIENT_LEASES.items():
+    for client_id, lease in list(CLIENT_LEASES.items()):
         if now - lease["last_used"] > LEASE_TTL_SECONDS:
             expired_clients.append(client_id)
 
@@ -150,56 +151,32 @@ def get_key_order_for_client(client_id):
         if not NVIDIA_KEYS:
             return []
 
-        sticky = CLIENT_LEASES.get(client_id)
+        sticky = CLIENT_LEASES.get(client_id, {}).get("key")
+        ordered = []
 
-        # если у клиента уже был ключ и он сейчас свободен — держим его первым
-        if (
-            sticky
-            and sticky["key"] in NVIDIA_KEYS
-            and KEY_STATE[sticky["key"]]["active"] == 0
-        ):
-            rest = [k for k in NVIDIA_KEYS if k != sticky["key"]]
-            rest.sort(key=lambda k: (KEY_STATE[k]["active"], KEY_STATE[k]["last_used"]))
-            return [sticky["key"]] + rest
+        if sticky in NVIDIA_KEYS:
+            ordered.append(sticky)
 
-        # иначе сначала свободные ключи, потом занятые
-        free_keys = [k for k in NVIDIA_KEYS if KEY_STATE[k]["active"] == 0]
-        busy_keys = [k for k in NVIDIA_KEYS if KEY_STATE[k]["active"] > 0]
+        remaining = [k for k in NVIDIA_KEYS if k != sticky]
+        free_keys = [k for k in remaining if KEY_STATE[k]["active"] == 0]
+        busy_keys = [k for k in remaining if KEY_STATE[k]["active"] > 0]
 
         if free_keys:
-            # небольшой стабильный порядок по fingerprint
             start = abs(hash(client_id)) % len(free_keys)
             free_keys = free_keys[start:] + free_keys[:start]
 
-            busy_keys.sort(key=lambda k: (KEY_STATE[k]["active"], KEY_STATE[k]["last_used"]))
-            return free_keys + busy_keys
+        busy_keys.sort(key=lambda k: (KEY_STATE[k]["active"], KEY_STATE[k]["last_used"]))
 
-        # если все заняты — выбираем наименее загруженный
-        ordered = sorted(
-            NVIDIA_KEYS,
-            key=lambda k: (KEY_STATE[k]["active"], KEY_STATE[k]["last_used"])
-        )
+        for key in free_keys + busy_keys:
+            if key not in ordered:
+                ordered.append(key)
+
         return ordered
 
 
-def acquire_key(client_id, preferred_key=None):
+def acquire_key(client_id, key):
     with STATE_LOCK:
         cleanup_expired_leases()
-
-        if not NVIDIA_KEYS:
-            return None
-
-        key = preferred_key
-        if key is None:
-            sticky = CLIENT_LEASES.get(client_id)
-            if sticky and sticky["key"] in NVIDIA_KEYS:
-                key = sticky["key"]
-
-        if key is None:
-            key_order = get_key_order_for_client(client_id)
-            if not key_order:
-                return None
-            key = key_order[0]
 
         if key not in KEY_STATE:
             return None
@@ -220,36 +197,6 @@ def release_key(client_id, key):
             CLIENT_LEASES[client_id]["last_used"] = time.time()
 
 
-# 🔁 запрос к модели
-def ask_model(api_key, model, messages, temperature, max_tokens, timeout):
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "top_p": 0.9,
-        "max_tokens": max_tokens,
-        "stream": False
-    }
-
-    try:
-        return requests.post(
-            URL,
-            headers=headers,
-            json=payload,
-            stream=True,
-            timeout=(30, timeout)
-        )
-    except Exception as e:
-        print(f"{model} ERROR:", str(e))
-        return None
-
-
-# 🧠 извлечение текста
 def extract_text_from_result(result):
     if not isinstance(result, dict):
         return ""
@@ -279,53 +226,7 @@ def extract_text_from_result(result):
     return ""
 
 
-def parse_stream_token(line):
-    if not line:
-        return ""
-
-    line = line.strip()
-    if not line:
-        return ""
-
-    if line.startswith("data:"):
-        payload = line[5:].strip()
-    else:
-        payload = line
-
-    if payload == "[DONE]":
-        return "__DONE__"
-
-    try:
-        obj = json.loads(payload)
-    except Exception:
-        return ""
-
-    return extract_text_from_result(obj)
-
-
-def extract_text_from_raw(raw):
-    if not raw:
-        return ""
-
-    raw = raw.strip()
-    if not raw:
-        return ""
-
-    try:
-        obj = json.loads(raw)
-        return extract_text_from_result(obj)
-    except Exception:
-        pass
-
-    for line in raw.splitlines():
-        token = parse_stream_token(line)
-        if token and token != "__DONE__":
-            return token
-
-    return ""
-
-
-def open_model_stream(api_key, model, messages, temperature, max_tokens, timeout):
+def ask_model(api_key, model, messages, temperature, max_tokens, timeout):
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -341,74 +242,32 @@ def open_model_stream(api_key, model, messages, temperature, max_tokens, timeout
     }
 
     try:
-        resp = requests.post(URL, headers=headers, json=payload, timeout=60)
+        resp = requests.post(
+            URL,
+            headers=headers,
+            json=payload,
+            timeout=(10, timeout)
+        )
+
         if resp.status_code != 200:
-            return None, f"HTTP {resp.status_code}"
+            return None, f"{model} HTTP {resp.status_code}: {resp.text[:300]}"
 
-        data = resp.json()
-        text = data["choices"][0]["message"]["content"]
+        try:
+            data = resp.json()
+        except Exception:
+            return None, f"{model} returned non-JSON response"
 
-        def one_shot():
-            yield text
+        text = extract_text_from_result(data).strip()
+        if not text:
+            text = resp.text.strip()
 
-        return one_shot(), None
+        if not text:
+            return None, f"{model} produced empty response"
+
+        return text, None
 
     except Exception as e:
-        return None, str(e)
-
-    if resp.status_code != 200:
-        body = ""
-        try:
-            body = resp.text
-        except Exception:
-            body = ""
-        resp.close()
-        return None, f"{model} HTTP {resp.status_code}: {body[:300]}"
-
-    iterator = resp.iter_lines(decode_unicode=True)
-
-    first_token = None
-    try:
-        for line in iterator:
-            token = parse_stream_token(line)
-            if token == "__DONE__":
-                break
-            if token:
-                first_token = token
-                break
-    except Exception as e:
-        resp.close()
-        return None, f"{model} STREAM ERROR: {str(e)}"
-
-    if first_token is None:
-        raw = ""
-        try:
-            raw = resp.text
-        except Exception:
-            raw = ""
-        fallback_text = extract_text_from_raw(raw)
-        resp.close()
-
-        if fallback_text:
-            def one_shot():
-                yield fallback_text
-            return one_shot(), None
-
-        return None, f"{model} produced no stream content"
-
-    def token_generator():
-        try:
-            yield first_token
-            for line in iterator:
-                token = parse_stream_token(line)
-                if token == "__DONE__":
-                    break
-                if token:
-                    yield token
-        finally:
-            resp.close()
-
-    return token_generator(), None
+        return None, f"{model} ERROR: {str(e)}"
 
 
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
@@ -418,7 +277,6 @@ def chat():
     if request.method == "OPTIONS":
         return "", 200
 
-    text = ""
     client_id = get_client_fingerprint()
     leased_key = None
 
@@ -426,7 +284,6 @@ def chat():
         data = request.get_json(force=True)
         incoming_messages = data.get("messages", [])
 
-        # 🧠 локальная память + новые сообщения
         memory = [m for m in memory if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
         memory = memory[-MAX_MEMORY_MESSAGES:]
 
@@ -437,54 +294,91 @@ def chat():
 
         incoming_tokens = data.get("max_tokens", 0)
         if not incoming_tokens or incoming_tokens == 0:
-            max_tokens = 900
+            max_tokens = 700
         else:
-            max_tokens = min(int(incoming_tokens), 900)
+            max_tokens = min(int(incoming_tokens), 700)
 
-        # порядок ключей: sticky -> свободные -> занятые
         key_candidates = get_key_order_for_client(client_id)
+        if not key_candidates:
+            return jsonify({
+                "error": {
+                    "message": "No NVIDIA API keys configured"
+                }
+            }), 500
 
-        stream_iter = None
-        chosen_model = None
+        final_text = None
 
         for api_key in key_candidates:
-            leased_key = acquire_key(client_id, preferred_key=api_key)
+            leased_key = acquire_key(client_id, api_key)
             if not leased_key:
                 continue
 
-            # сначала DeepSeek, потом fallback LLaMA — но на одном и том же ключе
-            for model, timeout, tokens in (
-                (MAIN_MODEL, 90, max_tokens),
-                (FAST_MODEL, 25, min(max_tokens, 400)),
-            ):
-                stream_iter, err = open_model_stream(
+            try:
+                # сначала DeepSeek
+                text, err = ask_model(
                     api_key=leased_key,
-                    model=model,
+                    model=MAIN_MODEL,
                     messages=full_messages,
                     temperature=temperature,
-                    max_tokens=tokens,
-                    timeout=timeout
+                    max_tokens=max_tokens,
+                    timeout=60
                 )
 
-                if stream_iter is not None:
-                    chosen_model = model
+                if text:
+                    final_text = text
                     print("KEY CHOSEN:", leased_key[:8] + "...")
-                    print("MODEL CHOSEN:", chosen_model)
+                    print("MODEL CHOSEN:", MAIN_MODEL)
                     break
-                else:
-                    print(err)
 
-            if stream_iter is not None:
-                break
+                print(err)
 
-            release_key(client_id, leased_key)
-            leased_key = None
+                # fallback LLaMA на том же ключе
+                text, err = ask_model(
+                    api_key=leased_key,
+                    model=FAST_MODEL,
+                    messages=full_messages,
+                    temperature=temperature,
+                    max_tokens=min(max_tokens, 400),
+                    timeout=25
+                )
 
-        if stream_iter is None:
-            text = "*thinking...*"
+                if text:
+                    final_text = text
+                    print("KEY CHOSEN:", leased_key[:8] + "...")
+                    print("MODEL CHOSEN:", FAST_MODEL)
+                    break
 
-            def fallback_generate():
-                try:
+                print(err)
+
+            except Exception as e:
+                print("REQUEST ERROR:", str(e))
+
+            if final_text is None:
+                release_key(client_id, leased_key)
+                leased_key = None
+
+        if not final_text:
+            final_text = "*thinking...*"
+
+        # обновляем память
+        if incoming_messages:
+            memory.append(incoming_messages[-1])
+        memory.append({"role": "assistant", "content": final_text})
+        memory[:] = memory[-MAX_MEMORY_MESSAGES:]
+        save_memory()
+
+        # стримим уже готовый текст в Janitor по словам
+        def generate():
+            try:
+                words = final_text.split()
+                if not words:
+                    yield f"data: {json.dumps({'id': f'chatcmpl-{int(time.time())}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': 'hybrid-ai', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': final_text}, 'finish_reason': 'stop'}]}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                first = True
+                for word in words:
+                    piece = word + " "
                     chunk = {
                         "id": f"chatcmpl-{int(time.time())}",
                         "object": "chat.completion.chunk",
@@ -494,78 +388,17 @@ def chat():
                             {
                                 "index": 0,
                                 "delta": {
-                                    "role": "assistant",
-                                    "content": text
+                                    "role": "assistant" if first else None,
+                                    "content": piece
                                 },
-                                "finish_reason": "stop"
+                                "finish_reason": None
                             }
                         ]
                     }
+                    first = False
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
-                finally:
-                    if leased_key:
-                        release_key(client_id, leased_key)
+                    time.sleep(0.015)
 
-            return Response(fallback_generate(), mimetype="text/event-stream")
-
-        def generate():
-            assembled = []
-            try:
-                for piece in stream_iter:
-                    if piece:
-                        assembled.append(piece)
-                        chunk = {
-                            "id": f"chatcmpl-{int(time.time())}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": "hybrid-ai",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "role": "assistant",
-                                        "content": piece
-                                    },
-                                    "finish_reason": None
-                                }
-                            ]
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-                final_text = "".join(assembled).strip()
-                if not final_text:
-                    final_text = "*thinking...*"
-
-                text_local = final_text
-
-                if incoming_messages:
-                    memory.append(incoming_messages[-1])
-                memory.append({"role": "assistant", "content": text_local})
-                memory[:] = memory[-MAX_MEMORY_MESSAGES:]
-                save_memory()
-
-                yield "data: [DONE]\n\n"
-
-            except Exception as e:
-                err_text = f"Server error: {str(e)}"
-                error_chunk = {
-                    "id": f"chatcmpl-{int(time.time())}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": "hybrid-ai",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": err_text
-                            },
-                            "finish_reason": "stop"
-                        }
-                    ]
-                }
-                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
 
             finally:
@@ -575,31 +408,30 @@ def chat():
         return Response(generate(), mimetype="text/event-stream")
 
     except Exception as e:
+        if leased_key:
+            release_key(client_id, leased_key)
+
         text = f"Server error: {str(e)}"
 
         def error_generate():
-            try:
-                chunk = {
-                    "id": f"chatcmpl-{int(time.time())}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": "hybrid-ai",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": text
-                            },
-                            "finish_reason": "stop"
-                        }
-                    ]
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-            finally:
-                if leased_key:
-                    release_key(client_id, leased_key)
+            chunk = {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "hybrid-ai",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": text
+                        },
+                        "finish_reason": "stop"
+                    }
+                ]
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
 
         return Response(error_generate(), mimetype="text/event-stream")
 
