@@ -233,7 +233,7 @@ def ask_model(api_key, model, messages, temperature, max_tokens, timeout):
         "temperature": temperature,
         "top_p": 0.9,
         "max_tokens": max_tokens,
-        "stream": True
+        "stream": False
     }
 
     try:
@@ -337,19 +337,24 @@ def open_model_stream(api_key, model, messages, temperature, max_tokens, timeout
         "temperature": temperature,
         "top_p": 0.9,
         "max_tokens": max_tokens,
-        "stream": True
+        "stream": False
     }
 
     try:
-        resp = requests.post(
-            URL,
-            headers=headers,
-            json=payload,
-            stream=True,
-            timeout=(30, timeout)
-        )
+        resp = requests.post(URL, headers=headers, json=payload, timeout=60)
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"]
+
+        def one_shot():
+            yield text
+
+        return one_shot(), None
+
     except Exception as e:
-        return None, f"{model} ERROR: {str(e)}"
+        return None, str(e)
 
     if resp.status_code != 200:
         body = ""
