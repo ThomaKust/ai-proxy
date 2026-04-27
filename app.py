@@ -12,11 +12,11 @@ CORS(app)
 
 URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-# 🧠 модели
 FAST_MODEL = "meta/llama-3.1-8b-instruct"
-MAIN_MODEL = "deepseek-ai/deepseek-v4-flash"
+MAIN_MODEL = "meta/llama-3.1-70b-instruct"  # более стабильный вариант
 
-# 🧠 ключи NVIDIA
+# ---------------- KEY LOADING ----------------
+
 def load_nvidia_keys():
     keys = []
     for env_name in (
@@ -31,216 +31,104 @@ def load_nvidia_keys():
             if value:
                 keys.append(value)
 
-    unique_keys = []
-    for key in keys:
-        if key not in unique_keys:
-            unique_keys.append(key)
-
-    return unique_keys
+    return list(dict.fromkeys(keys))
 
 
 NVIDIA_KEYS = load_nvidia_keys()
 
-# 🔒 состояние ключей
 KEY_STATE = {
     key: {"active": 0, "last_used": 0.0}
     for key in NVIDIA_KEYS
 }
 
 CLIENT_LEASES = {}
-LEASE_TTL_SECONDS = 20 * 60
-STATE_LOCK = threading.Lock()
+LEASE_TTL = 20 * 60
+LOCK = threading.Lock()
 
-# 🧠 ПАМЯТЬ
+# ---------------- MEMORY ----------------
+
 BASE_DIR = Path(__file__).resolve().parent
 MEMORY_FILE = BASE_DIR / "memory.json"
-MAX_MEMORY_MESSAGES = 50
+MAX_MEMORY = 50
 memory = []
-
-# 🎭 SYSTEM PROMPT
-SYSTEM_PROMPT = """
-Ты — персонаж в ролевом чате.
-
-Правила:
-- всегда пиши живо, эмоционально
-- используй действия в *звёздочках*
-- добавляй реакции, чувства, атмосферу
-- не пиши как ИИ
-- не обрывай ответы
-- делай ответы длинными и насыщенными
-
-Важно:
-- не говори что ты ИИ
-- не объясняй правила
-
-Write only from the perspective of {{char}}.
-Never write dialogue or actions for {{user}}.
-Compose your responses using long, well-written sentences;
-avoid using abrupt, monosyllabic phrases.
-Focus on the external description of the characters' actions,
-feelings, and thoughts.
-Add sudden actions and elements of surprise to the narrative.
-"""
 
 
 def load_memory():
     global memory
     if MEMORY_FILE.exists():
         try:
-            with MEMORY_FILE.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            loaded = data.get("memory", [])
-            memory = [
-                m for m in loaded
-                if isinstance(m, dict) and m.get("role") in ("user", "assistant")
-            ]
-            memory = memory[-MAX_MEMORY_MESSAGES:]
-        except Exception as e:
-            print("MEMORY LOAD ERROR:", str(e))
+            data = json.loads(MEMORY_FILE.read_text("utf-8"))
+            memory = data.get("memory", [])[-MAX_MEMORY:]
+        except:
             memory = []
 
 
-def save_memory():
-    try:
-        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with MEMORY_FILE.open("w", encoding="utf-8") as f:
-            json.dump(
-                {"memory": memory[-MAX_MEMORY_MESSAGES:]},
-                f,
-                ensure_ascii=False,
-                indent=2
+def save_memory_async():
+    def _save():
+        try:
+            MEMORY_FILE.write_text(
+                json.dumps({"memory": memory[-MAX_MEMORY:]}, ensure_ascii=False, indent=2),
+                "utf-8"
             )
-    except Exception as e:
-        print("MEMORY SAVE ERROR:", str(e))
+        except:
+            pass
+
+    threading.Thread(target=_save, daemon=True).start()
 
 
 load_memory()
 
-# создаём файл сразу, чтобы он точно появился рядом с app.py
-if not MEMORY_FILE.exists():
-    save_memory()
+# ---------------- PROMPT ----------------
 
+SYSTEM_PROMPT = """
+Ты — персонаж в ролевом чате.
+Пиши эмоционально, живо, с действиями *в звёздочках*.
+Не говори что ты ИИ.
+Пиши развернуто и непрерывно.
+"""
 
-def cleanup_expired_leases(now=None):
-    if now is None:
-        now = time.time()
+# ---------------- KEY SELECTION ----------------
 
-    expired_clients = []
-    for client_id, lease in list(CLIENT_LEASES.items()):
-        if now - lease["last_used"] > LEASE_TTL_SECONDS:
-            expired_clients.append(client_id)
-
-    for client_id in expired_clients:
-        del CLIENT_LEASES[client_id]
-
-
-def get_client_fingerprint():
-    forwarded_for = request.headers.get("X-Forwarded-For", "").strip()
-    if forwarded_for:
-        ip = forwarded_for.split(",")[0].strip()
-    else:
-        ip = request.remote_addr or "unknown"
-
-    ua = request.headers.get("User-Agent", "unknown")
-    return f"{ip}|{ua}"
-
-
-def choose_key_for_client(client_id):
-    with STATE_LOCK:
-        cleanup_expired_leases()
-
-        if not NVIDIA_KEYS:
-            return None
-
-        sticky = CLIENT_LEASES.get(client_id, {}).get("key")
-        ordered = []
-
-        if sticky in NVIDIA_KEYS:
-            ordered.append(sticky)
-
-        remaining = [k for k in NVIDIA_KEYS if k != sticky]
-        remaining.sort(key=lambda k: (KEY_STATE[k]["active"], KEY_STATE[k]["last_used"]))
-
-        for key in remaining:
-            if key not in ordered:
-                ordered.append(key)
-
-        for key in ordered:
-            if key not in KEY_STATE:
-                continue
-
-            KEY_STATE[key]["active"] += 1
-            now = time.time()
-            KEY_STATE[key]["last_used"] = now
-            CLIENT_LEASES[client_id] = {"key": key, "last_used": now}
-            return key
-
+def choose_key():
+    if not NVIDIA_KEYS:
         return None
 
-
-def release_key(client_id, key):
-    with STATE_LOCK:
-        if key in KEY_STATE and KEY_STATE[key]["active"] > 0:
-            KEY_STATE[key]["active"] -= 1
-
-        if client_id in CLIENT_LEASES and CLIENT_LEASES[client_id]["key"] == key:
-            CLIENT_LEASES[client_id]["last_used"] = time.time()
+    return min(
+        NVIDIA_KEYS,
+        key=lambda k: (KEY_STATE[k]["active"], KEY_STATE[k]["last_used"])
+    )
 
 
-def extract_text_from_result(result):
-    if not isinstance(result, dict):
-        return ""
+def release_key(key):
+    if key in KEY_STATE and KEY_STATE[key]["active"] > 0:
+        KEY_STATE[key]["active"] -= 1
 
-    if "choices" in result and result["choices"]:
-        choice = result["choices"][0]
-        if isinstance(choice, dict):
-            return (
-                choice.get("delta", {}).get("content", "")
-                or choice.get("message", {}).get("content", "")
-                or choice.get("text", "")
-            )
+# ---------------- SSE HELPERS ----------------
 
-    if "content" in result:
-        return result.get("content", "") or ""
-
-    if "outputs" in result and result["outputs"]:
-        try:
-            return result["outputs"][0].get("text", "") or ""
-        except Exception:
-            return ""
-
-    if "error" in result:
-        msg = result["error"].get("message", "Unknown")
-        return "API ERROR: " + msg
-
-    return ""
+def sse(data):
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-def make_chunk(content="", finish_reason=None, role=False, model_name="hybrid-ai"):
-    delta = {"content": content}
+def chunk(text, model, finish=None, role=False):
+    delta = {"content": text}
     if role:
-        delta = {"role": "assistant", "content": content}
+        delta = {"role": "assistant", "content": text}
 
     return {
-        "id": f"chatcmpl-{int(time.time())}",
+        "id": f"chatcmpl-{int(time.time()*1000)}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
-        "model": model_name,
-        "choices": [
-            {
-                "index": 0,
-                "delta": delta,
-                "finish_reason": finish_reason
-            }
-        ]
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish
+        }]
     }
 
+# ---------------- NVIDIA STREAM ----------------
 
-def sse(obj):
-    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
-
-
-def iter_nvidia_tokens(api_key, model, messages, temperature, max_tokens, timeout):
+def stream_nvidia(api_key, model, messages, temperature=0.8, max_tokens=600, timeout=60):
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -255,226 +143,127 @@ def iter_nvidia_tokens(api_key, model, messages, temperature, max_tokens, timeou
         "stream": True
     }
 
-    resp = None
-    try:
-        resp = requests.post(
-            URL,
-            headers=headers,
-            json=payload,
-            stream=True,
-            timeout=(10, timeout)
-        )
+    resp = requests.post(URL, headers=headers, json=payload, stream=True, timeout=(10, timeout))
 
-        if resp.status_code != 200:
-            body = ""
-            try:
-                body = resp.text
-            except Exception:
-                body = ""
-            raise RuntimeError(f"{model} HTTP {resp.status_code}: {body[:300]}")
+    if resp.status_code != 200:
+        raise RuntimeError(f"{model} HTTP {resp.status_code}: {resp.text[:200]}")
 
-        for raw_line in resp.iter_lines(decode_unicode=True):
-            if not raw_line:
-                continue
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
 
-            line = raw_line.strip()
-            if not line:
-                continue
+        if "data:" in line:
+            line = line.split("data:")[1].strip()
 
-            if line.startswith("data:"):
-                payload_line = line[5:].strip()
-            else:
-                payload_line = line
+        if line == "[DONE]":
+            break
 
-            if payload_line == "[DONE]":
-                break
-
-            try:
-                data = json.loads(payload_line)
-            except Exception:
-                continue
-
-            token = extract_text_from_result(data)
+        try:
+            data = json.loads(line)
+            token = (
+                data.get("choices", [{}])[0]
+                .get("delta", {})
+                .get("content", "")
+            )
             if token:
                 yield token
+        except:
+            continue
 
-    finally:
-        if resp is not None:
-            try:
-                resp.close()
-            except Exception:
-                pass
-
+# ---------------- ROUTE ----------------
 
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def chat():
-    global memory
-
     if request.method == "OPTIONS":
         return "", 200
 
-    client_id = get_client_fingerprint()
-    leased_key = None
+    client = request.headers.get("X-Forwarded-For", request.remote_addr or "x")
 
-    try:
-        data = request.get_json(force=True)
-        incoming_messages = data.get("messages", [])
+    key = choose_key()
+    if not key:
+        return jsonify({"error": "no keys"}), 500
 
-        memory = [
-            m for m in memory
-            if isinstance(m, dict) and m.get("role") in ("user", "assistant")
-        ]
-        memory = memory[-MAX_MEMORY_MESSAGES:]
+    with LOCK:
+        KEY_STATE[key]["active"] += 1
 
-        full_messages = memory + incoming_messages
-        full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + full_messages
+    data = request.get_json(force=True)
+    messages = data.get("messages", [])
 
-        temperature = data.get("temperature", 0.8)
+    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + memory + messages
 
-        incoming_tokens = data.get("max_tokens", 0)
-        if not incoming_tokens or incoming_tokens == 0:
-            max_tokens = 500
-        else:
-            max_tokens = min(int(incoming_tokens), 700)
+    def generate():
+        last_ping = time.time()
+        output = ""
 
-        leased_key = choose_key_for_client(client_id)
-        if not leased_key:
-            return jsonify({
-                "error": {
-                    "message": "No NVIDIA API keys configured"
-                }
-            }), 500
+        try:
+            # initial chunk (НЕ пустой)
+            yield sse(chunk("...", MAIN_MODEL, role=True))
 
-        def generate():
-            global memory
-
-            final_text = ""
-
+            # ---------------- MAIN MODEL ----------------
             try:
-                # стартовый chunk, чтобы соединение сразу считалось живым
-                yield sse(make_chunk("", None, role=True, model_name=MAIN_MODEL))
+                for token in stream_nvidia(key, MAIN_MODEL, full_messages):
+                    output += token
+                    yield sse(chunk(token, MAIN_MODEL))
 
-                # 1) DeepSeek streaming first
-                main_started = False
+                    # heartbeat
+                    if time.time() - last_ping > 10:
+                        yield "data: {}\n\n"
+                        last_ping = time.time()
+
+            except Exception as e:
+                yield sse(chunk(f"*fallback triggered: {str(e)}*", MAIN_MODEL))
+
+                # ---------------- FALLBACK ----------------
                 try:
-                    for token in iter_nvidia_tokens(
-                        api_key=leased_key,
-                        model=MAIN_MODEL,
-                        messages=full_messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        timeout=90
-                    ):
-                        if token:
-                            main_started = True
-                            final_text += token
-                            yield sse(make_chunk(token, None, role=False, model_name=MAIN_MODEL))
-                except Exception as e:
-                    print("MAIN STREAM ERROR:", str(e))
+                    for token in stream_nvidia(key, FAST_MODEL, full_messages):
+                        output += token
+                        yield sse(chunk(token, FAST_MODEL))
+                except Exception as e2:
+                    yield sse(chunk(f"*fatal error: {str(e2)}*", FAST_MODEL))
 
-                # 2) fallback to LLaMA if DeepSeek gave nothing
-                if not final_text.strip() or not main_started:
-                    final_text = ""
-                    try:
-                        for token in iter_nvidia_tokens(
-                            api_key=leased_key,
-                            model=FAST_MODEL,
-                            messages=full_messages,
-                            temperature=temperature,
-                            max_tokens=min(max_tokens, 400),
-                            timeout=25
-                        ):
-                            if token:
-                                final_text += token
-                                yield sse(make_chunk(token, None, role=False, model_name=FAST_MODEL))
-                    except Exception as e:
-                        print("FAST STREAM ERROR:", str(e))
+            if not output.strip():
+                output = "*no response*"
+                yield sse(chunk(output, "hybrid"))
 
-                # 3) autocompletion if response is short
-                if final_text and len(final_text) < 400:
-                    cont_messages = list(full_messages)
-                    cont_messages.append({"role": "assistant", "content": final_text})
-                    cont_messages.append({
-                        "role": "user",
-                        "content": "continue the response, make it longer and more detailed"
-                    })
+            # memory async save
+            if messages:
+                memory.append(messages[-1])
+            memory.append({"role": "assistant", "content": output})
+            memory[:] = memory[-MAX_MEMORY:]
+            save_memory_async()
 
-                    extra_text = ""
-                    try:
-                        for token in iter_nvidia_tokens(
-                            api_key=leased_key,
-                            model=FAST_MODEL,
-                            messages=cont_messages,
-                            temperature=temperature,
-                            max_tokens=300,
-                            timeout=25
-                        ):
-                            if token:
-                                extra_text += token
-                                yield sse(make_chunk(token, None, role=False, model_name=FAST_MODEL))
-                    except Exception as e:
-                        print("CONT STREAM ERROR:", str(e))
+            yield sse(chunk("", MAIN_MODEL, finish="stop"))
+            yield "data: [DONE]\n\n"
 
-                    if extra_text.strip():
-                        final_text = final_text.rstrip() + "\n" + extra_text.lstrip()
+        finally:
+            release_key(key)
 
-                if not final_text.strip():
-                    final_text = "*thinking...*"
-                    yield sse(make_chunk(final_text, None, role=False, model_name="hybrid-ai"))
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive"
+        }
+    )
 
-                # memory
-                try:
-                    if incoming_messages:
-                        memory.append(incoming_messages[-1])
-                    memory.append({"role": "assistant", "content": final_text})
-                    memory[:] = memory[-MAX_MEMORY_MESSAGES:]
-                    save_memory()
-                except Exception as e:
-                    print("MEMORY ERROR:", str(e))
+# ---------------- HEALTH ----------------
 
-                # final stop chunk
-                yield sse(make_chunk("", "stop", role=False, model_name="hybrid-ai"))
-                yield "data: [DONE]\n\n"
-
-            finally:
-                if leased_key:
-                    release_key(client_id, leased_key)
-
-        return Response(
-            generate(),
-            mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no"
-            }
-        )
-
-    except Exception as e:
-        if leased_key:
-            release_key(client_id, leased_key)
-
-        return jsonify({
-            "error": {
-                "message": f"Server error: {str(e)}"
-            }
-        }), 500
-
-
-@app.route("/v1/models", methods=["GET"])
+@app.route("/v1/models")
 def models():
     return jsonify({
         "object": "list",
-        "data": [
-            {"id": "hybrid-ai", "object": "model"}
-        ]
+        "data": [{"id": "hybrid-ai", "object": "model"}]
     })
 
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def root():
     return "OK"
 
+# ---------------- RUN ----------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
