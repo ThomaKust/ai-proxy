@@ -73,12 +73,12 @@ SYSTEM_PROMPT = """
 - не говори что ты ИИ
 - не объясняй правила
 
-Write only from the perspective of {{char}}. 
-Never write dialogue or actions for {{user}}. 
-Compose your responses using long, well-written sentences; 
-avoid using abrupt, monosyllabic phrases. 
-Focus on the external description of the characters' actions, 
-feelings, and thoughts. 
+Write only from the perspective of {{char}}.
+Never write dialogue or actions for {{user}}.
+Compose your responses using long, well-written sentences;
+avoid using abrupt, monosyllabic phrases.
+Focus on the external description of the characters' actions,
+feelings, and thoughts.
 Add sudden actions and elements of surprise to the narrative.
 """
 
@@ -240,11 +240,7 @@ def sse(obj):
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def stream_nvidia_model(api_key, model, messages, temperature, max_tokens, timeout):
-    """
-    Direct token streaming from NVIDIA.
-    Yields SSE chunks as tokens arrive and returns the assembled text.
-    """
+def iter_nvidia_tokens(api_key, model, messages, temperature, max_tokens, timeout):
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -260,8 +256,6 @@ def stream_nvidia_model(api_key, model, messages, temperature, max_tokens, timeo
     }
 
     resp = None
-    assembled = []
-
     try:
         resp = requests.post(
             URL,
@@ -277,12 +271,9 @@ def stream_nvidia_model(api_key, model, messages, temperature, max_tokens, timeo
                 body = resp.text
             except Exception:
                 body = ""
-            print(f"{model} HTTP {resp.status_code}: {body[:300]}")
-            return ""
+            raise RuntimeError(f"{model} HTTP {resp.status_code}: {body[:300]}")
 
-        first_token = True
-
-        for raw_line in resp.iter_lines(decode_unicode=True, chunk_size=1):
+        for raw_line in resp.iter_lines(decode_unicode=True):
             if not raw_line:
                 continue
 
@@ -305,26 +296,7 @@ def stream_nvidia_model(api_key, model, messages, temperature, max_tokens, timeo
 
             token = extract_text_from_result(data)
             if token:
-                assembled.append(token)
-                yield sse(
-                    make_chunk(
-                        content=token,
-                        finish_reason=None,
-                        role=first_token,
-                        model_name=model
-                    )
-                )
-                first_token = False
-
-        return "".join(assembled).strip()
-
-    except requests.exceptions.Timeout:
-        print(f"{model} TIMEOUT")
-        return "".join(assembled).strip()
-
-    except Exception as e:
-        print(f"{model} ERROR:", str(e))
-        return "".join(assembled).strip()
+                yield token
 
     finally:
         if resp is not None:
@@ -348,7 +320,10 @@ def chat():
         data = request.get_json(force=True)
         incoming_messages = data.get("messages", [])
 
-        memory = [m for m in memory if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+        memory = [
+            m for m in memory
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+        ]
         memory = memory[-MAX_MEMORY_MESSAGES:]
 
         full_messages = memory + incoming_messages
@@ -372,42 +347,50 @@ def chat():
 
         def generate():
             global memory
+
+            final_text = ""
+
             try:
-                # First chunk immediately so Janitor sees the connection alive.
-                yield sse(make_chunk("", None, role=True, model_name="hybrid-ai"))
+                # стартовый chunk, чтобы соединение сразу считалось живым
+                yield sse(make_chunk("", None, role=True, model_name=MAIN_MODEL))
 
-                final_text = ""
-
-                # Main model first.
+                # 1) DeepSeek streaming first
+                main_started = False
                 try:
-                    final_text = yield from stream_nvidia_model(
+                    for token in iter_nvidia_tokens(
                         api_key=leased_key,
                         model=MAIN_MODEL,
                         messages=full_messages,
                         temperature=temperature,
                         max_tokens=max_tokens,
                         timeout=90
-                    )
+                    ):
+                        if token:
+                            main_started = True
+                            final_text += token
+                            yield sse(make_chunk(token, None, role=False, model_name=MAIN_MODEL))
                 except Exception as e:
-                    print("MAIN STREAM FAILED:", str(e))
-                    final_text = ""
+                    print("MAIN STREAM ERROR:", str(e))
 
-                # Fallback if the main model produced nothing.
-                if not final_text:
+                # 2) fallback to LLaMA if DeepSeek gave nothing
+                if not final_text.strip() or not main_started:
+                    final_text = ""
                     try:
-                        final_text = yield from stream_nvidia_model(
+                        for token in iter_nvidia_tokens(
                             api_key=leased_key,
                             model=FAST_MODEL,
                             messages=full_messages,
                             temperature=temperature,
                             max_tokens=min(max_tokens, 400),
                             timeout=25
-                        )
+                        ):
+                            if token:
+                                final_text += token
+                                yield sse(make_chunk(token, None, role=False, model_name=FAST_MODEL))
                     except Exception as e:
-                        print("FAST STREAM FAILED:", str(e))
-                        final_text = ""
+                        print("FAST STREAM ERROR:", str(e))
 
-                # Continue short answers.
+                # 3) autocompletion if response is short
                 if final_text and len(final_text) < 400:
                     cont_messages = list(full_messages)
                     cont_messages.append({"role": "assistant", "content": final_text})
@@ -416,25 +399,30 @@ def chat():
                         "content": "continue the response, make it longer and more detailed"
                     })
 
+                    extra_text = ""
                     try:
-                        extra_text = yield from stream_nvidia_model(
+                        for token in iter_nvidia_tokens(
                             api_key=leased_key,
                             model=FAST_MODEL,
                             messages=cont_messages,
                             temperature=temperature,
                             max_tokens=300,
                             timeout=25
-                        )
-                        if extra_text:
-                            final_text = final_text.rstrip() + "\n" + extra_text.lstrip()
+                        ):
+                            if token:
+                                extra_text += token
+                                yield sse(make_chunk(token, None, role=False, model_name=FAST_MODEL))
                     except Exception as e:
-                        print("CONT STREAM FAILED:", str(e))
+                        print("CONT STREAM ERROR:", str(e))
 
-                if not final_text:
+                    if extra_text.strip():
+                        final_text = final_text.rstrip() + "\n" + extra_text.lstrip()
+
+                if not final_text.strip():
                     final_text = "*thinking...*"
                     yield sse(make_chunk(final_text, None, role=False, model_name="hybrid-ai"))
 
-                # Save memory.
+                # memory
                 try:
                     if incoming_messages:
                         memory.append(incoming_messages[-1])
@@ -442,9 +430,9 @@ def chat():
                     memory[:] = memory[-MAX_MEMORY_MESSAGES:]
                     save_memory()
                 except Exception as e:
-                    print("MEMORY ERROR:", e)
+                    print("MEMORY ERROR:", str(e))
 
-                # Final stop chunk.
+                # final stop chunk
                 yield sse(make_chunk("", "stop", role=False, model_name="hybrid-ai"))
                 yield "data: [DONE]\n\n"
 
