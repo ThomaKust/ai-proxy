@@ -236,25 +236,27 @@ def call_nvidia(api_key, model, messages, temperature, max_tokens, timeout):
             URL,
             headers=headers,
             json=payload,
-            timeout=(10, timeout)
+            timeout=(5, 15)  # 🔥 БЫЛО ДОЛГО → теперь максимум 15 сек
         )
 
         if resp.status_code != 200:
-            return None, f"{model} HTTP {resp.status_code}: {resp.text[:300]}"
+            return None, f"{model} HTTP {resp.status_code}"
 
-        try:
-            data = resp.json()
-        except Exception:
-            return None, f"{model} returned non-JSON response"
+        data = resp.json()
 
-        text = extract_text_from_result(data).strip()
+        text = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
         if not text:
-            text = resp.text.strip()
-
-        if not text:
-            return None, f"{model} produced empty response"
+            return None, "empty response"
 
         return text, None
+
+    except requests.exceptions.Timeout:
+        return None, f"{model} TIMEOUT"
 
     except Exception as e:
         return None, f"{model} ERROR: {str(e)}"
@@ -284,7 +286,7 @@ def chat():
 
         incoming_tokens = data.get("max_tokens", 0)
         if not incoming_tokens or incoming_tokens == 0:
-            max_tokens = 700
+            max_tokens = 300
         else:
             max_tokens = min(int(incoming_tokens), 700)
 
@@ -306,7 +308,7 @@ def chat():
             messages=full_messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            timeout=60
+            timeout=15
         )
 
         if text:
@@ -324,7 +326,7 @@ def chat():
                 messages=full_messages,
                 temperature=temperature,
                 max_tokens=min(max_tokens, 400),
-                timeout=25
+                timeout=10
             )
 
             if text:
