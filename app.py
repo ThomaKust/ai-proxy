@@ -20,11 +20,11 @@ MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "120"))
 PROMPT_HISTORY_MESSAGES = int(os.getenv("PROMPT_HISTORY_MESSAGES", "24"))
 MIN_OUTPUT_CHARS = int(os.getenv("MIN_OUTPUT_CHARS", "2200"))
 MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "3"))
-HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "10"))
+HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "1400"))
 DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "900"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.85"))
-STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "25"))
+STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "120"))
 REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "10"))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -289,6 +289,8 @@ def stream_nvidia(api_key, model, messages, temperature, max_tokens, read_timeou
         timeout=(REQUEST_CONNECT_TIMEOUT, read_timeout),
     )
 
+    resp.raw.decode_content = True
+
     try:
         if resp.status_code != 200:
             body = ""
@@ -299,7 +301,7 @@ def stream_nvidia(api_key, model, messages, temperature, max_tokens, read_timeou
             raise RuntimeError(f"{model} HTTP {resp.status_code}: {body[:300]}")
 
         for raw_line in resp.iter_lines(decode_unicode=True, chunk_size=1):
-            if not raw_line:
+            if raw_line is None:
                 continue
 
             line = raw_line.strip()
@@ -415,7 +417,7 @@ def chat():
                 return sse(make_chunk(text, model_name=model_name, finish_reason=finish_reason, role=role))
 
             try:
-                yield push("...", model_name=MAIN_MODEL, role=True)
+                yield push("thinking...", model_name=MAIN_MODEL, role=True)
 
                 # 1) Main generation
                 try:
@@ -437,6 +439,10 @@ def chat():
                     yield push(f"*main model fallback: {str(main_error)}*", model_name=MAIN_MODEL)
 
                 output_text = "".join(output_parts)
+
+                # если модель дала слишком мало текста — не мучаем её автодопиской
+                if len(output_text.strip()) < 200:
+                    continuation_round = MAX_CONTINUATION_ROUNDS
 
                 # 2) Fallback if main model produced nothing or too little
                 if len(output_text.strip()) < 20:
@@ -499,7 +505,7 @@ def chat():
                     else:
                         output_text = output_text + extra_text
 
-                final_text = "".join(output_parts).strip()
+                final_text = output_text.strip()
 
                 if not final_text:
                     final_text = "*thinking...*"
