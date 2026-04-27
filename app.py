@@ -236,22 +236,23 @@ def call_nvidia(api_key, model, messages, temperature, max_tokens, timeout):
             URL,
             headers=headers,
             json=payload,
-            timeout=(5, 15)  # 🔥 БЫЛО ДОЛГО → теперь максимум 15 сек
+            timeout=(10, timeout)
         )
 
         if resp.status_code != 200:
-            return None, f"{model} HTTP {resp.status_code}"
+            return None, f"{model} HTTP {resp.status_code}: {resp.text[:300]}"
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception:
+            return None, f"{model} returned non-JSON response"
 
-        text = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+        text = extract_text_from_result(data).strip()
+        if not text:
+            text = resp.text.strip()
 
         if not text:
-            return None, "empty response"
+            return None, f"{model} produced empty response"
 
         return text, None
 
@@ -286,7 +287,7 @@ def chat():
 
         incoming_tokens = data.get("max_tokens", 0)
         if not incoming_tokens or incoming_tokens == 0:
-            max_tokens = 300
+            max_tokens = 500
         else:
             max_tokens = min(int(incoming_tokens), 700)
 
@@ -301,7 +302,7 @@ def chat():
         final_text = None
         chosen_model = None
 
-        # Главная модель
+        # Главная модель: DeepSeek
         text, err = call_nvidia(
             api_key=leased_key,
             model=MAIN_MODEL,
@@ -319,7 +320,7 @@ def chat():
         else:
             print(err)
 
-            # Fallback
+            # Fallback: LLaMA
             text, err = call_nvidia(
                 api_key=leased_key,
                 model=FAST_MODEL,
