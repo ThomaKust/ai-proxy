@@ -6,6 +6,7 @@ import time
 import os
 import threading
 from pathlib import Path
+from queue import Queue, Empty
 
 app = Flask(__name__)
 CORS(app)
@@ -24,7 +25,7 @@ HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "1400"))
 DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "900"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.85"))
-STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "120"))
+STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "180"))
 REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "10"))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -86,7 +87,6 @@ def load_memory():
 
 
 def save_memory_async():
-    snapshot = None
     with memory_lock:
         snapshot = list(memory[-MAX_MEMORY_MESSAGES:])
 
@@ -407,16 +407,12 @@ def chat():
             }), 500
 
         def generate():
-            output_parts = []
+            output_text = ""
             last_ping = time.time()
+            token_queue = Queue()
+            worker_state = {"done": False, "error": None}
 
-            def push(text, model_name=MAIN_MODEL, finish_reason=None, role=False):
-                return sse(make_chunk(text, model_name=model_name, finish_reason=finish_reason, role=role))
-
-            try:
-                yield push(" ", model_name=MAIN_MODEL, role=True)
-
-                # 1) Main generation
+            def nvidia_worker():
                 try:
                     for token in stream_nvidia(
                         api_key=leased_key,
@@ -425,26 +421,32 @@ def chat():
                         temperature=temperature,
                         max_tokens=main_max_tokens,
                     ):
-                        output_parts.append(token)
-                        yield push(token, model_name=MAIN_MODEL)
+                        token_queue.put(token)
+                except Exception as e:
+                    worker_state["error"] = str(e)
+                    print("MAIN STREAM ERROR:", str(e))
+                finally:
+                    worker_state["done"] = True
 
+            threading.Thread(target=nvidia_worker, daemon=True).start()
+
+            try:
+                # Initial small chunk so the connection is clearly alive.
+                yield sse(make_chunk(" ", model_name=MAIN_MODEL, role=True))
+
+                # Drain main model stream.
+                while not worker_state["done"] or not token_queue.empty():
+                    try:
+                        token = token_queue.get(timeout=0.5)
+                        output_text += token
+                        yield sse(make_chunk(token, model_name=MAIN_MODEL))
+                    except Empty:
                         if time.time() - last_ping >= HEARTBEAT_SECONDS:
                             yield "data: {}\n\n"
                             last_ping = time.time()
 
-                except Exception as main_error:
-                    yield push(f"*main model fallback: {str(main_error)}*", model_name=MAIN_MODEL)
-
-                output_text = "".join(output_parts)
-
-                # если модель дала слишком мало текста — не мучаем её автодопиской
-                if len(output_text.strip()) < 200:
-                    continuation_round = MAX_CONTINUATION_ROUNDS
-
-                # 2) Fallback if main model produced nothing or too little
-                if len(output_text.strip()) < 20:
-                    output_parts = []
-
+                # Silent fallback to fast model if main model produced almost nothing.
+                if len(output_text.strip()) < 50:
                     try:
                         for token in stream_nvidia(
                             api_key=leased_key,
@@ -453,27 +455,25 @@ def chat():
                             temperature=temperature,
                             max_tokens=min(main_max_tokens, 900),
                         ):
-                            output_parts.append(token)
-                            yield push(token, model_name=FAST_MODEL)
+                            output_text += token
+                            yield sse(make_chunk(token, model_name=FAST_MODEL))
 
                             if time.time() - last_ping >= HEARTBEAT_SECONDS:
                                 yield "data: {}\n\n"
                                 last_ping = time.time()
-
                     except Exception as fast_error:
-                        yield push(f"*fast fallback error: {str(fast_error)}*", model_name=FAST_MODEL)
+                        print("FAST STREAM ERROR:", str(fast_error))
 
-                    output_text = "".join(output_parts)
-
-                # 3) Continuation rounds until response is long enough
+                # Continuation rounds until answer is long enough.
                 continuation_round = 0
                 while len(output_text.strip()) < target_chars and continuation_round < MAX_CONTINUATION_ROUNDS:
                     continuation_round += 1
+
                     cont_messages = prompt_messages + [
                         {"role": "assistant", "content": output_text},
-                    ] + continuation_prompt(output_text)
+                        {"role": "user", "content": "Continue naturally. Do not repeat. Extend the scene."},
+                    ]
 
-                    extra_parts = []
                     try:
                         for token in stream_nvidia(
                             api_key=leased_key,
@@ -482,38 +482,25 @@ def chat():
                             temperature=temperature,
                             max_tokens=continuation_max_tokens,
                         ):
-                            extra_parts.append(token)
-                            yield push(token, model_name=MAIN_MODEL)
+                            output_text += token
+                            yield sse(make_chunk(token, model_name=MAIN_MODEL))
 
                             if time.time() - last_ping >= HEARTBEAT_SECONDS:
                                 yield "data: {}\n\n"
                                 last_ping = time.time()
-
                     except Exception as cont_error:
-                        yield push(f"*continuation error: {str(cont_error)}*", model_name=MAIN_MODEL)
+                        print("CONTINUATION ERROR:", str(cont_error))
                         break
 
-                    extra_text = "".join(extra_parts).strip()
-                    if not extra_text:
-                        break
+                if not output_text.strip():
+                    output_text = "*thinking...*"
+                    yield sse(make_chunk(output_text, model_name="hybrid-ai"))
 
-                    if output_text and extra_text.startswith(output_text[-120:]):
-                        output_text = output_text + extra_text[len(output_text[-120:]):]
-                    else:
-                        output_text = output_text + extra_text
-
-                final_text = output_text.strip()
-
-                if not final_text:
-                    final_text = "*thinking...*"
-                    yield push(final_text, model_name="hybrid-ai")
-
-                # 4) Memory save
                 try:
-                    append_memory_turns(incoming_messages, final_text)
+                    append_memory_turns(incoming_messages, output_text)
                     save_memory_async()
                 except Exception as mem_error:
-                    yield push(f"*memory error: {str(mem_error)}*", model_name="hybrid-ai")
+                    print("MEMORY SAVE ERROR:", str(mem_error))
 
                 yield sse(make_chunk("", model_name="hybrid-ai", finish_reason="stop"))
                 yield "data: [DONE]\n\n"
