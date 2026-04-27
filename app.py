@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, Response, jsonify
 from flask_cors import CORS
 import requests
 import json
@@ -263,6 +263,65 @@ def call_nvidia(api_key, model, messages, temperature, max_tokens, timeout):
         return None, f"{model} ERROR: {str(e)}"
 
 
+def build_final_text(api_key, full_messages, temperature, max_tokens):
+    text = None
+
+    deep_text, deep_err = call_nvidia(
+        api_key=api_key,
+        model=MAIN_MODEL,
+        messages=full_messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=90
+    )
+
+    if deep_text:
+        text = deep_text
+    else:
+        print(deep_err)
+
+        fast_text, fast_err = call_nvidia(
+            api_key=api_key,
+            model=FAST_MODEL,
+            messages=full_messages,
+            temperature=temperature,
+            max_tokens=min(max_tokens, 400),
+            timeout=25
+        )
+
+        if fast_text:
+            text = fast_text
+        else:
+            print(fast_err)
+
+    if text and len(text) < 400:
+        cont_messages = list(full_messages)
+        cont_messages.append({"role": "assistant", "content": text})
+        cont_messages.append({
+            "role": "user",
+            "content": "continue the response, make it longer and more detailed"
+        })
+
+        extra_text, extra_err = call_nvidia(
+            api_key=api_key,
+            model=FAST_MODEL,
+            messages=cont_messages,
+            temperature=temperature,
+            max_tokens=300,
+            timeout=25
+        )
+
+        if extra_text:
+            text = text.rstrip() + "\n" + extra_text.lstrip()
+        else:
+            print(extra_err)
+
+    if not text:
+        text = "*thinking...*"
+
+    return text
+
+
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def chat():
     global memory
@@ -299,90 +358,107 @@ def chat():
                 }
             }), 500
 
-        final_text = None
-        chosen_model = None
+        result_box = {"text": None}
+        done = threading.Event()
 
-        # Главная модель: DeepSeek
-        text, err = call_nvidia(
-            api_key=leased_key,
-            model=MAIN_MODEL,
-            messages=full_messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=15
-        )
+        def worker():
+            try:
+                result_box["text"] = build_final_text(
+                    api_key=leased_key,
+                    full_messages=full_messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+            finally:
+                done.set()
+                release_key(client_id, leased_key)
 
-        if text:
-            final_text = text
-            chosen_model = MAIN_MODEL
-            print("KEY CHOSEN:", leased_key[:8] + "...")
-            print("MODEL CHOSEN:", chosen_model)
-        else:
-            print(err)
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
 
-            # Fallback: LLaMA
-            text, err = call_nvidia(
-                api_key=leased_key,
-                model=FAST_MODEL,
-                messages=full_messages,
-                temperature=temperature,
-                max_tokens=min(max_tokens, 400),
-                timeout=10
-            )
-
-            if text:
-                final_text = text
-                chosen_model = FAST_MODEL
-                print("KEY CHOSEN:", leased_key[:8] + "...")
-                print("MODEL CHOSEN:", chosen_model)
-            else:
-                print(err)
-
-        if not final_text:
-            final_text = "*thinking...*"
-            chosen_model = "hybrid-ai"
-
-        # память
-        if incoming_messages:
-            memory.append(incoming_messages[-1])
-        memory.append({"role": "assistant", "content": final_text})
-        memory[:] = memory[-MAX_MEMORY_MESSAGES:]
-        save_memory()
-
-        response = {
-            "id": f"chatcmpl-{int(time.time())}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": chosen_model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_text
-                    },
-                    "finish_reason": "stop"
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
+        def sse_chunk(content, finish_reason=None, role=False):
+            return {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "hybrid-ai",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": ({
+                            "role": "assistant",
+                            "content": content
+                        } if role else {
+                            "content": content
+                        }),
+                        "finish_reason": finish_reason
+                    }
+                ]
             }
-        }
 
-        return jsonify(response)
+        def generate():
+            # сразу отдаем пустой стартовый chunk, чтобы Janitor не ронял соединение
+            yield f"data: {json.dumps(sse_chunk('', None, role=True), ensure_ascii=False)}\n\n"
+
+            last_heartbeat = time.time()
+            while not done.is_set():
+                if time.time() - last_heartbeat >= 5:
+                    yield f"data: {json.dumps(sse_chunk(' ', None), ensure_ascii=False)}\n\n"
+                    last_heartbeat = time.time()
+                time.sleep(0.5)
+
+            final_text = result_box["text"] or "*thinking...*"
+
+            if incoming_messages:
+                memory.append(incoming_messages[-1])
+            memory.append({"role": "assistant", "content": final_text})
+            memory[:] = memory[-MAX_MEMORY_MESSAGES:]
+            save_memory()
+
+            words = final_text.split()
+            if not words:
+                yield f"data: {json.dumps(sse_chunk(final_text, 'stop', role=True), ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+
+            first_word = True
+            for word in words:
+                piece = word + " "
+                yield f"data: {json.dumps(sse_chunk(piece, None, role=first_word), ensure_ascii=False)}\n\n"
+                first_word = False
+                time.sleep(0.01)
+
+            yield "data: [DONE]\n\n"
+
+        return Response(generate(), mimetype="text/event-stream")
 
     except Exception as e:
-        return jsonify({
-            "error": {
-                "message": f"Server error: {str(e)}"
-            }
-        }), 500
-
-    finally:
         if leased_key:
             release_key(client_id, leased_key)
+
+        text = f"Server error: {str(e)}"
+
+        def error_generate():
+            chunk = {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "hybrid-ai",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": text
+                        },
+                        "finish_reason": "stop"
+                    }
+                ]
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return Response(error_generate(), mimetype="text/event-stream")
 
 
 @app.route("/v1/models", methods=["GET"])
