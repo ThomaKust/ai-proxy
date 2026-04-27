@@ -402,8 +402,11 @@ def chat():
 
             # пока модель думает — шлём heartbeat
             while not done.is_set():
-                yield f"data: {json.dumps(sse_chunk('.', None), ensure_ascii=False)}\n\n"
-                time.sleep(0.2)
+                try:
+                    yield f"data: {json.dumps(sse_chunk('', None), ensure_ascii=False)}\n\n"
+                    time.sleep(2)
+                except Exception:
+                    break
 
             # получили финальный текст
             final_text = result_box["text"] or "*thinking...*"
@@ -416,8 +419,20 @@ def chat():
             save_memory()
 
             # отправляем финальный ответ ОДНИМ куском
-            yield f"data: {json.dumps(sse_chunk(final_text, 'stop'), ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
+            yield f"data: {json.dumps({
+                'id': f'chatcmpl-{int(time.time())}',
+                'object': 'chat.completion.chunk',
+                'created': int(time.time()),
+                'model': 'hybrid-ai',
+                'choices': [{
+                    'index': 0,
+                    'delta': {
+                        'role': 'assistant',
+                        'content': final_text
+                    },
+                    'finish_reason': 'stop'
+                }]
+            }, ensure_ascii=False)}\n\n"
         
         return Response(generate(), mimetype="text/event-stream")
 
