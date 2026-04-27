@@ -19,11 +19,11 @@ MAIN_MODEL = os.getenv("MAIN_MODEL", "meta/llama-3.1-70b-instruct")
 # Tuneable limits via Render env vars.
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "120"))
 PROMPT_HISTORY_MESSAGES = int(os.getenv("PROMPT_HISTORY_MESSAGES", "24"))
-MIN_OUTPUT_CHARS = int(os.getenv("MIN_OUTPUT_CHARS", "2200"))
-MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "3"))
+MIN_OUTPUT_CHARS = int(os.getenv("MIN_OUTPUT_CHARS", "2800"))
+MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "4"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
-DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "1400"))
-DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "900"))
+DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "1800"))
+DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "1000"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.85"))
 STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "180"))
 REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "10"))
@@ -333,8 +333,8 @@ def stream_nvidia(api_key, model, messages, temperature, max_tokens, read_timeou
 
 
 def estimate_output_target(requested_max_tokens):
-    base = max(MIN_OUTPUT_CHARS, requested_max_tokens * 3)
-    return min(base, 8000)
+    base = max(MIN_OUTPUT_CHARS, requested_max_tokens * 4)
+    return min(base, 12000)
 
 
 def continuation_prompt(current_text):
