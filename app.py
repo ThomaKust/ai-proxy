@@ -369,6 +369,7 @@ def chat():
                     temperature=temperature,
                     max_tokens=max_tokens
                 )
+                print("FINAL TEXT LEN:", len(result_box["text"]) if result_box["text"] else 0)
             finally:
                 done.set()
                 release_key(client_id, leased_key)
@@ -397,28 +398,33 @@ def chat():
             }
 
         def generate():
+            global memory
+        
             # старт — сразу (иначе Janitor рвёт соединение)
             yield f"data: {json.dumps(sse_chunk('', None, role=True), ensure_ascii=False)}\n\n"
-
-            # пока модель думает — шлём heartbeat
+              
+            # heartbeat пока думает модель
             while not done.is_set():
                 try:
                     yield f"data: {json.dumps(sse_chunk('', None), ensure_ascii=False)}\n\n"
                     time.sleep(2)
                 except Exception:
-                    break
+                    return  # важно: не break, а выйти полностью
 
-            # получили финальный текст
+             # финальный текст
             final_text = result_box["text"] or "*thinking...*"
 
             # сохраняем память
-            if incoming_messages:
-                memory.append(incoming_messages[-1])
-            memory.append({"role": "assistant", "content": final_text})
-            memory[:] = memory[-MAX_MEMORY_MESSAGES:]
-            save_memory()
+            try:
+                if incoming_messages:
+                    memory.append(incoming_messages[-1])
+                memory.append({"role": "assistant", "content": final_text})
+                memory[:] = memory[-MAX_MEMORY_MESSAGES:]
+                save_memory()
+            except Exception as e:
+                print("MEMORY ERROR:", e)
 
-            # отправляем финальный ответ ОДНИМ куском
+            # финальный chunk
             yield f"data: {json.dumps({
                 'id': f'chatcmpl-{int(time.time())}',
                 'object': 'chat.completion.chunk',
@@ -433,6 +439,9 @@ def chat():
                     'finish_reason': 'stop'
                 }]
             }, ensure_ascii=False)}\n\n"
+
+            # ❗ ОБЯЗАТЕЛЬНО
+            yield "data: [DONE]\n\n"
         
         return Response(generate(), mimetype="text/event-stream")
 
