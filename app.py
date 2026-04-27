@@ -397,9 +397,10 @@ def chat():
             }
 
         def generate():
-            # сразу отдаем пустой стартовый chunk, чтобы Janitor не ронял соединение
+            # стартовый chunk сразу
             yield f"data: {json.dumps(sse_chunk('', None, role=True), ensure_ascii=False)}\n\n"
 
+            # heartbeat, чтобы соединение не висело “мёртвым”
             last_heartbeat = time.time()
             while not done.is_set():
                 if time.time() - last_heartbeat >= 5:
