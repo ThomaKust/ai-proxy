@@ -418,6 +418,8 @@ def chat():
             # отправляем финальный ответ ОДНИМ куском
             yield f"data: {json.dumps(sse_chunk(final_text, 'stop'), ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
+        
+        return Response(generate(), mimetype="text/event-stream")
 
     except Exception as e:
         if leased_key:
