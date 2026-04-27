@@ -113,7 +113,6 @@ if not MEMORY_FILE.exists():
 
 SYSTEM_PROMPT = """
 Ты — персонаж в ролевом чате.
-
 Правила:
 - всегда пиши живо, эмоционально
 - используй действия в *звёздочках*
@@ -123,12 +122,10 @@ SYSTEM_PROMPT = """
 - делай ответы длинными и насыщенными
 - не повторяйся без нужды
 - продолжай сцену естественно, без резких обрывов
-
 Важно:
 - не говори, что ты ИИ
 - не объясняй правила
 - не выходи из роли
-
 Write only from the perspective of {{char}}.
 Never write dialogue or actions for {{user}}.
 Compose your responses using long, well-written sentences;
@@ -417,7 +414,7 @@ def chat():
                 return sse(make_chunk(text, model_name=model_name, finish_reason=finish_reason, role=role))
 
             try:
-                yield push("thinking...", model_name=MAIN_MODEL, role=True)
+                yield push(" ", model_name=MAIN_MODEL, role=True)
 
                 # 1) Main generation
                 try:
