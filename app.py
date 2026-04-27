@@ -1,4 +1,4 @@
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response, jsonify, stream_with_context
 from flask_cors import CORS
 import requests
 import json
@@ -10,10 +10,29 @@ from pathlib import Path
 app = Flask(__name__)
 CORS(app)
 
-URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-FAST_MODEL = "meta/llama-3.1-8b-instruct"
-MAIN_MODEL = "meta/llama-3.1-70b-instruct"  # более стабильный вариант
+FAST_MODEL = os.getenv("FAST_MODEL", "meta/llama-3.1-8b-instruct")
+MAIN_MODEL = os.getenv("MAIN_MODEL", "meta/llama-3.1-70b-instruct")
+
+# Tuneable limits via Render env vars.
+MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "120"))
+PROMPT_HISTORY_MESSAGES = int(os.getenv("PROMPT_HISTORY_MESSAGES", "24"))
+MIN_OUTPUT_CHARS = int(os.getenv("MIN_OUTPUT_CHARS", "2200"))
+MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "3"))
+HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "10"))
+DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "1400"))
+DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "900"))
+DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.85"))
+STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "25"))
+REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "10"))
+
+BASE_DIR = Path(__file__).resolve().parent
+MEMORY_FILE = BASE_DIR / "memory.json"
+
+app_lock = threading.Lock()
+memory = []
+memory_lock = threading.Lock()
 
 # ---------------- KEY LOADING ----------------
 
@@ -30,7 +49,6 @@ def load_nvidia_keys():
             value = value.removeprefix("Bearer ").strip()
             if value:
                 keys.append(value)
-
     return list(dict.fromkeys(keys))
 
 
@@ -40,37 +58,46 @@ KEY_STATE = {
     key: {"active": 0, "last_used": 0.0}
     for key in NVIDIA_KEYS
 }
-
 CLIENT_LEASES = {}
-LEASE_TTL = 20 * 60
-LOCK = threading.Lock()
+LEASE_TTL = 20 * 60  # 20 minutes
+
 
 # ---------------- MEMORY ----------------
 
-BASE_DIR = Path(__file__).resolve().parent
-MEMORY_FILE = BASE_DIR / "memory.json"
-MAX_MEMORY = 50
-memory = []
-
-
 def load_memory():
     global memory
-    if MEMORY_FILE.exists():
-        try:
-            data = json.loads(MEMORY_FILE.read_text("utf-8"))
-            memory = data.get("memory", [])[-MAX_MEMORY:]
-        except:
+    if not MEMORY_FILE.exists():
+        memory = []
+        return
+
+    try:
+        raw = MEMORY_FILE.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        loaded = data.get("memory", [])
+        if isinstance(loaded, list):
+            memory = [
+                m for m in loaded
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant", "system")
+            ][-MAX_MEMORY_MESSAGES:]
+        else:
             memory = []
+    except Exception:
+        memory = []
 
 
 def save_memory_async():
+    snapshot = None
+    with memory_lock:
+        snapshot = list(memory[-MAX_MEMORY_MESSAGES:])
+
     def _save():
         try:
+            MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
             MEMORY_FILE.write_text(
-                json.dumps({"memory": memory[-MAX_MEMORY:]}, ensure_ascii=False, indent=2),
-                "utf-8"
+                json.dumps({"memory": snapshot}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
-        except:
+        except Exception:
             pass
 
     threading.Thread(target=_save, daemon=True).start()
@@ -78,60 +105,171 @@ def save_memory_async():
 
 load_memory()
 
+if not MEMORY_FILE.exists():
+    save_memory_async()
+
+
 # ---------------- PROMPT ----------------
 
 SYSTEM_PROMPT = """
 Ты — персонаж в ролевом чате.
-Пиши эмоционально, живо, с действиями *в звёздочках*.
-Не говори что ты ИИ.
-Пиши развернуто и непрерывно.
-"""
+
+Правила:
+- всегда пиши живо, эмоционально
+- используй действия в *звёздочках*
+- добавляй реакции, чувства, атмосферу
+- не пиши как ИИ
+- не обрывай ответы
+- делай ответы длинными и насыщенными
+- не повторяйся без нужды
+- продолжай сцену естественно, без резких обрывов
+
+Важно:
+- не говори, что ты ИИ
+- не объясняй правила
+- не выходи из роли
+
+Write only from the perspective of {{char}}.
+Never write dialogue or actions for {{user}}.
+Compose your responses using long, well-written sentences;
+avoid abrupt, monosyllabic phrases.
+Focus on the external description of the characters' actions,
+feelings, and thoughts.
+Add sudden actions and elements of surprise to the narrative.
+
+Always write a substantial reply.
+Prefer a detailed answer over a short one.
+If the scene is not finished, continue it instead of ending early.
+""".strip()
+
 
 # ---------------- KEY SELECTION ----------------
 
-def choose_key():
-    if not NVIDIA_KEYS:
+def cleanup_expired_leases(now=None):
+    if now is None:
+        now = time.time()
+
+    expired = []
+    for client_id, lease in list(CLIENT_LEASES.items()):
+        if now - lease.get("last_used", 0.0) > LEASE_TTL:
+            expired.append(client_id)
+
+    for client_id in expired:
+        CLIENT_LEASES.pop(client_id, None)
+
+
+def choose_key_for_client(client_id):
+    with app_lock:
+        cleanup_expired_leases()
+
+        if not NVIDIA_KEYS:
+            return None
+
+        sticky = CLIENT_LEASES.get(client_id, {}).get("key")
+        ordered = []
+
+        if sticky in NVIDIA_KEYS:
+            ordered.append(sticky)
+
+        remaining = [k for k in NVIDIA_KEYS if k != sticky]
+        remaining.sort(key=lambda k: (KEY_STATE[k]["active"], KEY_STATE[k]["last_used"]))
+
+        for key in remaining:
+            if key not in ordered:
+                ordered.append(key)
+
+        for key in ordered:
+            if key not in KEY_STATE:
+                continue
+
+            KEY_STATE[key]["active"] += 1
+            now = time.time()
+            KEY_STATE[key]["last_used"] = now
+            CLIENT_LEASES[client_id] = {"key": key, "last_used": now}
+            return key
+
         return None
 
-    return min(
-        NVIDIA_KEYS,
-        key=lambda k: (KEY_STATE[k]["active"], KEY_STATE[k]["last_used"])
-    )
 
+def release_key(client_id, key):
+    with app_lock:
+        if key in KEY_STATE and KEY_STATE[key]["active"] > 0:
+            KEY_STATE[key]["active"] -= 1
 
-def release_key(key):
-    if key in KEY_STATE and KEY_STATE[key]["active"] > 0:
-        KEY_STATE[key]["active"] -= 1
+        if client_id in CLIENT_LEASES and CLIENT_LEASES[client_id].get("key") == key:
+            CLIENT_LEASES[client_id]["last_used"] = time.time()
+
 
 # ---------------- SSE HELPERS ----------------
 
-def sse(data):
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+def sse(obj):
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
-def chunk(text, model, finish=None, role=False):
+def make_chunk(text="", model_name=MAIN_MODEL, finish_reason=None, role=False):
     delta = {"content": text}
     if role:
         delta = {"role": "assistant", "content": text}
 
     return {
-        "id": f"chatcmpl-{int(time.time()*1000)}",
+        "id": f"chatcmpl-{int(time.time() * 1000)}",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": delta,
-            "finish_reason": finish
-        }]
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }
+        ],
     }
+
+
+def safe_message_list(messages):
+    cleaned = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        if role in ("system", "user", "assistant") and isinstance(content, str) and content.strip():
+            cleaned.append({"role": role, "content": content})
+    return cleaned
+
+
+def get_client_fingerprint():
+    forwarded_for = request.headers.get("X-Forwarded-For", "").strip()
+    if forwarded_for:
+        ip = forwarded_for.split(",")[0].strip()
+    else:
+        ip = request.remote_addr or "unknown"
+
+    ua = request.headers.get("User-Agent", "unknown")
+    return f"{ip}|{ua}"
+
+
+def build_prompt(incoming_messages):
+    with memory_lock:
+        mem_snapshot = list(memory)
+
+    mem_snapshot = safe_message_list(mem_snapshot)[-MAX_MEMORY_MESSAGES:]
+    recent_memory = mem_snapshot[-PROMPT_HISTORY_MESSAGES:]
+
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        *recent_memory,
+        *safe_message_list(incoming_messages),
+    ]
+
 
 # ---------------- NVIDIA STREAM ----------------
 
-def stream_nvidia(api_key, model, messages, temperature=0.8, max_tokens=600, timeout=60):
+def stream_nvidia(api_key, model, messages, temperature, max_tokens, read_timeout=STREAM_READ_TIMEOUT):
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
     }
 
     payload = {
@@ -140,35 +278,94 @@ def stream_nvidia(api_key, model, messages, temperature=0.8, max_tokens=600, tim
         "temperature": temperature,
         "top_p": 0.9,
         "max_tokens": max_tokens,
-        "stream": True
+        "stream": True,
     }
 
-    resp = requests.post(URL, headers=headers, json=payload, stream=True, timeout=(10, timeout))
+    resp = requests.post(
+        NVIDIA_URL,
+        headers=headers,
+        json=payload,
+        stream=True,
+        timeout=(REQUEST_CONNECT_TIMEOUT, read_timeout),
+    )
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"{model} HTTP {resp.status_code}: {resp.text[:200]}")
+    try:
+        if resp.status_code != 200:
+            body = ""
+            try:
+                body = resp.text
+            except Exception:
+                body = ""
+            raise RuntimeError(f"{model} HTTP {resp.status_code}: {body[:300]}")
 
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line:
-            continue
+        for raw_line in resp.iter_lines(decode_unicode=True, chunk_size=1):
+            if not raw_line:
+                continue
 
-        if "data:" in line:
-            line = line.split("data:")[1].strip()
+            line = raw_line.strip()
+            if not line:
+                continue
 
-        if line == "[DONE]":
-            break
+            if line.startswith("data:"):
+                line = line[5:].strip()
 
-        try:
-            data = json.loads(line)
-            token = (
-                data.get("choices", [{}])[0]
-                .get("delta", {})
-                .get("content", "")
-            )
+            if line == "[DONE]":
+                break
+
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+
+            choices = data.get("choices") or []
+            if not choices:
+                continue
+
+            delta = choices[0].get("delta") or {}
+            token = delta.get("content") or ""
             if token:
                 yield token
-        except:
-            continue
+
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
+def estimate_output_target(requested_max_tokens):
+    base = max(MIN_OUTPUT_CHARS, requested_max_tokens * 3)
+    return min(base, 8000)
+
+
+def continuation_prompt(current_text):
+    tail = current_text[-500:]
+    return [
+        {
+            "role": "user",
+            "content": (
+                "Continue the scene naturally from the last sentence. "
+                "Do not restart, do not summarize, do not repeat earlier text. "
+                "Write at least several more substantial paragraphs."
+            ),
+        },
+        {"role": "assistant", "content": tail},
+    ]
+
+
+def append_memory_turns(user_messages, assistant_text):
+    with memory_lock:
+        if user_messages:
+            last_user = user_messages[-1]
+            if isinstance(last_user, dict) and last_user.get("role") == "user":
+                memory.append({
+                    "role": "user",
+                    "content": last_user.get("content", ""),
+                })
+
+        memory.append({"role": "assistant", "content": assistant_text})
+        memory[:] = safe_message_list(memory)[-MAX_MEMORY_MESSAGES:]
+
 
 # ---------------- ROUTE ----------------
 
@@ -177,92 +374,186 @@ def chat():
     if request.method == "OPTIONS":
         return "", 200
 
-    client = request.headers.get("X-Forwarded-For", request.remote_addr or "x")
+    client_id = get_client_fingerprint()
+    leased_key = None
 
-    key = choose_key()
-    if not key:
-        return jsonify({"error": "no keys"}), 500
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+        incoming_messages = safe_message_list(data.get("messages", []))
 
-    with LOCK:
-        KEY_STATE[key]["active"] += 1
-
-    data = request.get_json(force=True)
-    messages = data.get("messages", [])
-
-    full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + memory + messages
-
-    def generate():
-        last_ping = time.time()
-        output = ""
-
+        temperature = data.get("temperature", DEFAULT_TEMPERATURE)
         try:
-            # initial chunk (НЕ пустой)
-            yield sse(chunk("...", MAIN_MODEL, role=True))
+            temperature = float(temperature)
+        except Exception:
+            temperature = DEFAULT_TEMPERATURE
 
-            # ---------------- MAIN MODEL ----------------
+        requested_max_tokens = data.get("max_tokens", DEFAULT_MAX_TOKENS)
+        try:
+            requested_max_tokens = int(requested_max_tokens)
+        except Exception:
+            requested_max_tokens = DEFAULT_MAX_TOKENS
+
+        main_max_tokens = max(256, min(requested_max_tokens, DEFAULT_MAX_TOKENS))
+        continuation_max_tokens = max(256, min(DEFAULT_CONTINUATION_TOKENS, 1400))
+        target_chars = estimate_output_target(main_max_tokens)
+
+        prompt_messages = build_prompt(incoming_messages)
+
+        leased_key = choose_key_for_client(client_id)
+        if not leased_key:
+            return jsonify({
+                "error": {
+                    "message": "No NVIDIA API keys configured"
+                }
+            }), 500
+
+        def generate():
+            output_parts = []
+            last_ping = time.time()
+
+            def push(text, model_name=MAIN_MODEL, finish_reason=None, role=False):
+                return sse(make_chunk(text, model_name=model_name, finish_reason=finish_reason, role=role))
+
             try:
-                for token in stream_nvidia(key, MAIN_MODEL, full_messages):
-                    output += token
-                    yield sse(chunk(token, MAIN_MODEL))
+                yield push("...", model_name=MAIN_MODEL, role=True)
 
-                    # heartbeat
-                    if time.time() - last_ping > 10:
-                        yield "data: {}\n\n"
-                        last_ping = time.time()
-
-            except Exception as e:
-                yield sse(chunk(f"*fallback triggered: {str(e)}*", MAIN_MODEL))
-
-                # ---------------- FALLBACK ----------------
+                # 1) Main generation
                 try:
-                    for token in stream_nvidia(key, FAST_MODEL, full_messages):
-                        output += token
-                        yield sse(chunk(token, FAST_MODEL))
-                except Exception as e2:
-                    yield sse(chunk(f"*fatal error: {str(e2)}*", FAST_MODEL))
+                    for token in stream_nvidia(
+                        api_key=leased_key,
+                        model=MAIN_MODEL,
+                        messages=prompt_messages,
+                        temperature=temperature,
+                        max_tokens=main_max_tokens,
+                    ):
+                        output_parts.append(token)
+                        yield push(token, model_name=MAIN_MODEL)
 
-            if not output.strip():
-                output = "*no response*"
-                yield sse(chunk(output, "hybrid"))
+                        if time.time() - last_ping >= HEARTBEAT_SECONDS:
+                            yield "data: {}\n\n"
+                            last_ping = time.time()
 
-            # memory async save
-            if messages:
-                memory.append(messages[-1])
-            memory.append({"role": "assistant", "content": output})
-            memory[:] = memory[-MAX_MEMORY:]
-            save_memory_async()
+                except Exception as main_error:
+                    yield push(f"*main model fallback: {str(main_error)}*", model_name=MAIN_MODEL)
 
-            yield sse(chunk("", MAIN_MODEL, finish="stop"))
-            yield "data: [DONE]\n\n"
+                output_text = "".join(output_parts)
 
-        finally:
-            release_key(key)
+                # 2) Fallback if main model produced nothing or too little
+                if len(output_text.strip()) < 20:
+                    output_parts = []
 
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive"
-        }
-    )
+                    try:
+                        for token in stream_nvidia(
+                            api_key=leased_key,
+                            model=FAST_MODEL,
+                            messages=prompt_messages,
+                            temperature=temperature,
+                            max_tokens=min(main_max_tokens, 900),
+                        ):
+                            output_parts.append(token)
+                            yield push(token, model_name=FAST_MODEL)
 
-# ---------------- HEALTH ----------------
+                            if time.time() - last_ping >= HEARTBEAT_SECONDS:
+                                yield "data: {}\n\n"
+                                last_ping = time.time()
 
-@app.route("/v1/models")
+                    except Exception as fast_error:
+                        yield push(f"*fast fallback error: {str(fast_error)}*", model_name=FAST_MODEL)
+
+                    output_text = "".join(output_parts)
+
+                # 3) Continuation rounds until response is long enough
+                continuation_round = 0
+                while len(output_text.strip()) < target_chars and continuation_round < MAX_CONTINUATION_ROUNDS:
+                    continuation_round += 1
+                    cont_messages = prompt_messages + [
+                        {"role": "assistant", "content": output_text},
+                    ] + continuation_prompt(output_text)
+
+                    extra_parts = []
+                    try:
+                        for token in stream_nvidia(
+                            api_key=leased_key,
+                            model=MAIN_MODEL,
+                            messages=cont_messages,
+                            temperature=temperature,
+                            max_tokens=continuation_max_tokens,
+                        ):
+                            extra_parts.append(token)
+                            yield push(token, model_name=MAIN_MODEL)
+
+                            if time.time() - last_ping >= HEARTBEAT_SECONDS:
+                                yield "data: {}\n\n"
+                                last_ping = time.time()
+
+                    except Exception as cont_error:
+                        yield push(f"*continuation error: {str(cont_error)}*", model_name=MAIN_MODEL)
+                        break
+
+                    extra_text = "".join(extra_parts).strip()
+                    if not extra_text:
+                        break
+
+                    if output_text and extra_text.startswith(output_text[-120:]):
+                        output_text = output_text + extra_text[len(output_text[-120:]):]
+                    else:
+                        output_text = output_text + extra_text
+
+                final_text = "".join(output_parts).strip()
+
+                if not final_text:
+                    final_text = "*thinking...*"
+                    yield push(final_text, model_name="hybrid-ai")
+
+                # 4) Memory save
+                try:
+                    append_memory_turns(incoming_messages, final_text)
+                    save_memory_async()
+                except Exception as mem_error:
+                    yield push(f"*memory error: {str(mem_error)}*", model_name="hybrid-ai")
+
+                yield sse(make_chunk("", model_name="hybrid-ai", finish_reason="stop"))
+                yield "data: [DONE]\n\n"
+
+            finally:
+                if leased_key:
+                    release_key(client_id, leased_key)
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
+    except Exception as e:
+        if leased_key:
+            release_key(client_id, leased_key)
+
+        return jsonify({
+            "error": {
+                "message": f"Server error: {str(e)}"
+            }
+        }), 500
+
+
+@app.route("/v1/models", methods=["GET"])
 def models():
     return jsonify({
         "object": "list",
-        "data": [{"id": "hybrid-ai", "object": "model"}]
+        "data": [
+            {"id": "hybrid-ai", "object": "model"}
+        ]
     })
 
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def root():
     return "OK"
 
-# ---------------- RUN ----------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
