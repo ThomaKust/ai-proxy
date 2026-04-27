@@ -397,41 +397,27 @@ def chat():
             }
 
         def generate():
-            # стартовый chunk сразу
+            # старт — сразу (иначе Janitor рвёт соединение)
             yield f"data: {json.dumps(sse_chunk('', None, role=True), ensure_ascii=False)}\n\n"
 
-            # heartbeat, чтобы соединение не висело “мёртвым”
-            last_heartbeat = time.time()
+            # пока модель думает — шлём heartbeat
             while not done.is_set():
-                if time.time() - last_heartbeat >= 5:
-                    yield f"data: {json.dumps(sse_chunk(' ', None), ensure_ascii=False)}\n\n"
-                    last_heartbeat = time.time()
-                time.sleep(0.5)
+                yield f"data: {json.dumps(sse_chunk('.', None), ensure_ascii=False)}\n\n"
+                time.sleep(0.2)
 
+            # получили финальный текст
             final_text = result_box["text"] or "*thinking...*"
 
+            # сохраняем память
             if incoming_messages:
                 memory.append(incoming_messages[-1])
             memory.append({"role": "assistant", "content": final_text})
             memory[:] = memory[-MAX_MEMORY_MESSAGES:]
             save_memory()
 
-            words = final_text.split()
-            if not words:
-                yield f"data: {json.dumps(sse_chunk(final_text, 'stop', role=True), ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-
-            first_word = True
-            for word in words:
-                piece = word + " "
-                yield f"data: {json.dumps(sse_chunk(piece, None, role=first_word), ensure_ascii=False)}\n\n"
-                first_word = False
-                time.sleep(0.01)
-
+            # отправляем финальный ответ ОДНИМ куском
+            yield f"data: {json.dumps(sse_chunk(final_text, 'stop'), ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
-
-        return Response(generate(), mimetype="text/event-stream")
 
     except Exception as e:
         if leased_key:
