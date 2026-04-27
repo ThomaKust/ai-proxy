@@ -73,12 +73,12 @@ SYSTEM_PROMPT = """
 - не говори что ты ИИ
 - не объясняй правила
 
-Write only from the perspective of {{char}}. 
-Never write dialogue or actions for {{user}}. 
-Compose your responses using long, well-written sentences; 
-avoid using abrupt, monosyllabic phrases. 
-Focus on the external description of the characters' actions, 
-feelings, and thoughts. 
+Write only from the perspective of {{char}}.
+Never write dialogue or actions for {{user}}.
+Compose your responses using long, well-written sentences;
+avoid using abrupt, monosyllabic phrases.
+Focus on the external description of the characters' actions,
+feelings, and thoughts.
 Add sudden actions and elements of surprise to the narrative.
 """
 
@@ -216,7 +216,35 @@ def extract_text_from_result(result):
     return ""
 
 
-def call_nvidia(api_key, model, messages, temperature, max_tokens, timeout):
+def make_chunk(content="", finish_reason=None, role=False, model_name="hybrid-ai"):
+    delta = {"content": content}
+    if role:
+        delta = {"role": "assistant", "content": content}
+
+    return {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+def sse(obj):
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def yield_model_stream(api_key, model, messages, temperature, max_tokens, timeout):
+    """
+    Streams tokens from NVIDIA directly and yields OpenAI-style SSE chunks.
+    Returns the full assembled text as the generator return value.
+    """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -228,98 +256,80 @@ def call_nvidia(api_key, model, messages, temperature, max_tokens, timeout):
         "temperature": temperature,
         "top_p": 0.9,
         "max_tokens": max_tokens,
-        "stream": False
+        "stream": True
     }
 
+    resp = None
     try:
         resp = requests.post(
             URL,
             headers=headers,
             json=payload,
+            stream=True,
             timeout=(10, timeout)
         )
 
         if resp.status_code != 200:
-            return None, f"{model} HTTP {resp.status_code}: {resp.text[:300]}"
+            body = ""
+            try:
+                body = resp.text
+            except Exception:
+                body = ""
+            raise RuntimeError(f"{model} HTTP {resp.status_code}: {body[:300]}")
+
+        assembled = []
+        first = True
 
         try:
-            data = resp.json()
-        except Exception:
-            return None, f"{model} returned non-JSON response"
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
 
-        text = extract_text_from_result(data).strip()
-        if not text:
-            text = resp.text.strip()
+                line = raw_line.strip()
+                if not line:
+                    continue
 
-        if not text:
-            return None, f"{model} produced empty response"
+                if line.startswith("data:"):
+                    payload_line = line[5:].strip()
+                else:
+                    payload_line = line
 
-        return text, None
+                if payload_line == "[DONE]":
+                    break
 
-    except requests.exceptions.Timeout:
-        return None, f"{model} TIMEOUT"
+                try:
+                    data = json.loads(payload_line)
+                except Exception:
+                    continue
+
+                token = extract_text_from_result(data)
+                if token:
+                    assembled.append(token)
+
+                    chunk = make_chunk(
+                        content=token,
+                        finish_reason=None,
+                        role=first,
+                        model_name=model
+                    )
+                    first = False
+                    yield sse(chunk)
+
+        except Exception as e:
+            print(f"{model} STREAM ERROR:", str(e))
+
+        return "".join(assembled).strip()
 
     except Exception as e:
-        return None, f"{model} ERROR: {str(e)}"
+        print(f"{model} ERROR:", str(e))
+        raise
 
-
-def build_final_text(api_key, full_messages, temperature, max_tokens):
-    text = None
-
-    deep_text, deep_err = call_nvidia(
-        api_key=api_key,
-        model=MAIN_MODEL,
-        messages=full_messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        timeout=90
-    )
-
-    if deep_text:
-        text = deep_text
-    else:
-        print(deep_err)
-
-        fast_text, fast_err = call_nvidia(
-            api_key=api_key,
-            model=FAST_MODEL,
-            messages=full_messages,
-            temperature=temperature,
-            max_tokens=min(max_tokens, 400),
-            timeout=25
-        )
-
-        if fast_text:
-            text = fast_text
-        else:
-            print(fast_err)
-
-    if text and len(text) < 400:
-        cont_messages = list(full_messages)
-        cont_messages.append({"role": "assistant", "content": text})
-        cont_messages.append({
-            "role": "user",
-            "content": "continue the response, make it longer and more detailed"
-        })
-
-        extra_text, extra_err = call_nvidia(
-            api_key=api_key,
-            model=FAST_MODEL,
-            messages=cont_messages,
-            temperature=temperature,
-            max_tokens=300,
-            timeout=25
-        )
-
-        if extra_text:
-            text = text.rstrip() + "\n" + extra_text.lstrip()
-        else:
-            print(extra_err)
-
-    if not text:
-        text = "*thinking...*"
-
-    return text
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
 
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
@@ -336,7 +346,10 @@ def chat():
         data = request.get_json(force=True)
         incoming_messages = data.get("messages", [])
 
-        memory = [m for m in memory if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+        memory = [
+            m for m in memory
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+        ]
         memory = memory[-MAX_MEMORY_MESSAGES:]
 
         full_messages = memory + incoming_messages
@@ -358,120 +371,105 @@ def chat():
                 }
             }), 500
 
-        result_box = {"text": None}
-        done = threading.Event()
-
-        def worker():
-            try:
-                result_box["text"] = build_final_text(
-                    api_key=leased_key,
-                    full_messages=full_messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-                print("FINAL TEXT LEN:", len(result_box["text"]) if result_box["text"] else 0)
-            finally:
-                done.set()
-                release_key(client_id, leased_key)
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-
-        def sse_chunk(content, finish_reason=None, role=False):
-            return {
-                "id": f"chatcmpl-{int(time.time())}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": "hybrid-ai",
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": ({
-                            "role": "assistant",
-                            "content": content
-                        } if role else {
-                            "content": content
-                        }),
-                        "finish_reason": finish_reason
-                    }
-                ]
-            }
-
         def generate():
             global memory
-        
-            # старт — сразу (иначе Janitor рвёт соединение)
-            yield f"data: {json.dumps(sse_chunk('', None, role=True), ensure_ascii=False)}\n\n"
-              
-            # heartbeat пока думает модель
-            while not done.is_set():
-                try:
-                    yield f"data: {json.dumps(sse_chunk('', None), ensure_ascii=False)}\n\n"
-                    time.sleep(2)
-                except Exception:
-                    return  # важно: не break, а выйти полностью
 
-             # финальный текст
-            final_text = result_box["text"] or "*thinking...*"
-
-            # сохраняем память
             try:
+                # мгновенный стартовый chunk
+                yield sse(make_chunk("", None, role=True, model_name="hybrid-ai"))
+
+                final_text = ""
+
+                # 1) DeepSeek first
+                try:
+                    main_stream = yield_model_stream(
+                        api_key=leased_key,
+                        model=MAIN_MODEL,
+                        messages=full_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=90
+                    )
+                    final_text = yield from main_stream
+                except Exception as e:
+                    print("MAIN STREAM FAILED:", str(e))
+
+                # 2) fallback to LLaMA if DeepSeek produced nothing
+                if not final_text:
+                    try:
+                        fast_stream = yield_model_stream(
+                            api_key=leased_key,
+                            model=FAST_MODEL,
+                            messages=full_messages,
+                            temperature=temperature,
+                            max_tokens=min(max_tokens, 400),
+                            timeout=25
+                        )
+                        final_text = yield from fast_stream
+                    except Exception as e:
+                        print("FAST STREAM FAILED:", str(e))
+
+                # 3) autocompletion if answer is short
+                if final_text and len(final_text) < 400:
+                    cont_messages = list(full_messages)
+                    cont_messages.append({"role": "assistant", "content": final_text})
+                    cont_messages.append({
+                        "role": "user",
+                        "content": "continue the response, make it longer and more detailed"
+                    })
+
+                    try:
+                        extra_stream = yield_model_stream(
+                            api_key=leased_key,
+                            model=FAST_MODEL,
+                            messages=cont_messages,
+                            temperature=temperature,
+                            max_tokens=300,
+                            timeout=25
+                        )
+                        extra_text = yield from extra_stream
+                        if extra_text:
+                            final_text += ("\n" if final_text else "") + extra_text
+                    except Exception as e:
+                        print("CONT STREAM FAILED:", str(e))
+
+                if not final_text:
+                    final_text = "*thinking...*"
+                    yield sse(make_chunk(final_text, None, role=False, model_name="hybrid-ai"))
+
+                # memory
                 if incoming_messages:
                     memory.append(incoming_messages[-1])
                 memory.append({"role": "assistant", "content": final_text})
                 memory[:] = memory[-MAX_MEMORY_MESSAGES:]
                 save_memory()
-            except Exception as e:
-                print("MEMORY ERROR:", e)
 
-            # финальный chunk
-            yield f"data: {json.dumps({
-                'id': f'chatcmpl-{int(time.time())}',
-                'object': 'chat.completion.chunk',
-                'created': int(time.time()),
-                'model': 'hybrid-ai',
-                'choices': [{
-                    'index': 0,
-                    'delta': {
-                        'role': 'assistant',
-                        'content': final_text
-                    },
-                    'finish_reason': 'stop'
-                }]
-            }, ensure_ascii=False)}\n\n"
+                # final stop chunk
+                yield sse(make_chunk("", "stop", role=False, model_name="hybrid-ai"))
+                yield "data: [DONE]\n\n"
 
-            # ❗ ОБЯЗАТЕЛЬНО
-            yield "data: [DONE]\n\n"
-        
-        return Response(generate(), mimetype="text/event-stream")
+            finally:
+                if leased_key:
+                    release_key(client_id, leased_key)
+
+        return Response(
+            generate(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
     except Exception as e:
         if leased_key:
             release_key(client_id, leased_key)
 
-        text = f"Server error: {str(e)}"
-
-        def error_generate():
-            chunk = {
-                "id": f"chatcmpl-{int(time.time())}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": "hybrid-ai",
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "content": text
-                        },
-                        "finish_reason": "stop"
-                    }
-                ]
+        return jsonify({
+            "error": {
+                "message": f"Server error: {str(e)}"
             }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return Response(error_generate(), mimetype="text/event-stream")
+        }), 500
 
 
 @app.route("/v1/models", methods=["GET"])
