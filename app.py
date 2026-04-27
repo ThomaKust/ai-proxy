@@ -334,7 +334,7 @@ def stream_nvidia(api_key, model, messages, temperature, max_tokens, read_timeou
 
 def estimate_output_target(requested_max_tokens):
     base = max(MIN_OUTPUT_CHARS, requested_max_tokens * 4)
-    return min(base, 12000)
+    return min(base, 8000)
 
 
 def continuation_prompt(current_text):
