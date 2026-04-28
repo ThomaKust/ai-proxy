@@ -412,6 +412,9 @@ def chat():
             token_queue = Queue()
             worker_state = {"done": False, "error": None}
 
+            startup_deadline = time.time() + 12  # ждём до 12 сек старт ответа
+            min_stream_end = time.time() + 8     # минимум 8 сек держим поток
+
             def nvidia_worker():
                 try:
                     for token in stream_nvidia(
@@ -435,18 +438,32 @@ def chat():
                 yield sse(make_chunk(" ", model_name=MAIN_MODEL, role=True))
 
                 # Drain main model stream.
-                while not worker_state["done"] or not token_queue.empty():
+                while (
+                    not worker_state["done"]
+                    or not token_queue.empty()
+                    or time.time() < startup_deadline
+                ):
                     try:
-                        token = token_queue.get(timeout=0.5)
+                        token = token_queue.get_nowait()
                         output_text += token
                         yield sse(make_chunk(token, model_name=MAIN_MODEL))
+                        idle_cycles = 0
+
                     except Empty:
+                        idle_cycles += 1
+                        time.sleep(0.05)
+
+                        # heartbeat
                         if time.time() - last_ping >= HEARTBEAT_SECONDS:
                             yield "data: {}\n\n"
                             last_ping = time.time()
 
+                        # ❗ НЕ выходим слишком рано
+                        if idle_cycles > 200 and time.time() > startup_deadline:
+                            break
+
                 # Silent fallback to fast model if main model produced almost nothing.
-                if len(output_text.strip()) < 50:
+                if len(output_text.strip()) < 150 and worker_state["error"]:
                     try:
                         for token in stream_nvidia(
                             api_key=leased_key,
@@ -495,6 +512,9 @@ def chat():
                 if not output_text.strip():
                     output_text = "*thinking...*"
                     yield sse(make_chunk(output_text, model_name="hybrid-ai"))
+
+                if time.time() < min_stream_end:
+                    time.sleep(1)
 
                 try:
                     append_memory_turns(incoming_messages, output_text)
