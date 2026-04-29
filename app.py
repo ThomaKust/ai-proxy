@@ -20,12 +20,12 @@ MAIN_MODEL = os.getenv("MAIN_MODEL", "meta/llama-3.1-70b-instruct")
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "120"))
 PROMPT_HISTORY_MESSAGES = int(os.getenv("PROMPT_HISTORY_MESSAGES", "24"))
 MIN_OUTPUT_CHARS = int(os.getenv("MIN_OUTPUT_CHARS", "2800"))
-MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "5"))
+MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "6"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
-DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "1800"))
-DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "1000"))
+DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "2200"))
+DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "1200"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.85"))
-STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "100"))
+STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "180"))
 REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "10"))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -437,6 +437,8 @@ def chat():
                 # Initial small chunk so the connection is clearly alive.
                 yield sse(make_chunk(" ", model_name=MAIN_MODEL, role=True))
 
+                idle_cycles = 0
+                
                 # Drain main model stream.
                 while (
                     not worker_state["done"]
@@ -459,11 +461,11 @@ def chat():
                             last_ping = time.time()
 
                         # ❗ НЕ выходим слишком рано
-                        if idle_cycles > 80 and time.time() > startup_deadline:
+                        if idle_cycles > 120 and worker_state["done"]:
                             break
 
                 # Silent fallback to fast model if main model produced almost nothing.
-                if len(output_text.strip()) < 50:
+                if len(output_text.strip()) < 50 and worker_state["error"]:
                     try:
                         for token in stream_nvidia(
                             api_key=leased_key,
