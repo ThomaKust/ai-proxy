@@ -14,7 +14,7 @@ CORS(app)
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 FAST_MODEL = os.getenv("FAST_MODEL", "meta/llama-3.1-8b-instruct")
-MAIN_MODEL = os.getenv("MAIN_MODEL", "meta/llama-3.1-70b-instruct")
+MAIN_MODEL = os.getenv("MAIN_MODEL", "deepseek-ai/deepseek-v4-flash")
 
 # Tuneable limits via Render env vars.
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "120"))
