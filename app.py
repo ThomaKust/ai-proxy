@@ -444,22 +444,22 @@ def chat():
                     or time.time() < startup_deadline
                 ):
                     try:
-                        token = token_queue.get_nowait()
+                        # 🔥 ВАЖНО: ждём токен
+                        token = token_queue.get(timeout=0.5)
                         output_text += token
                         yield sse(make_chunk(token, model_name=MAIN_MODEL))
                         idle_cycles = 0
-
+                    
                     except Empty:
                         idle_cycles += 1
-                        time.sleep(0.05)
-
+                        
                         # heartbeat
                         if time.time() - last_ping >= HEARTBEAT_SECONDS:
                             yield "data: {}\n\n"
                             last_ping = time.time()
 
                         # ❗ НЕ выходим слишком рано
-                        if idle_cycles > 200 and time.time() > startup_deadline:
+                        if idle_cycles > 40 and time.time() > startup_deadline:
                             break
 
                 # Silent fallback to fast model if main model produced almost nothing.
