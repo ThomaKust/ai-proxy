@@ -412,7 +412,7 @@ def chat():
             token_queue = Queue()
             worker_state = {"done": False, "error": None}
 
-            startup_deadline = time.time() + 12  # ждём до 12 сек старт ответа
+            startup_deadline = time.time() + 25  # ждём до 12 сек старт ответа
             min_stream_end = time.time() + 8     # минимум 8 сек держим поток
 
             def nvidia_worker():
@@ -451,7 +451,7 @@ def chat():
                         idle_cycles = 0
                     
                     except Empty:
-                        idle_cycles += 1
+                        idle_cycles = 0
                         
                         # heartbeat
                         if time.time() - last_ping >= HEARTBEAT_SECONDS:
@@ -459,11 +459,11 @@ def chat():
                             last_ping = time.time()
 
                         # ❗ НЕ выходим слишком рано
-                        if idle_cycles > 40 and time.time() > startup_deadline:
+                        if idle_cycles > 80 and time.time() > startup_deadline:
                             break
 
                 # Silent fallback to fast model if main model produced almost nothing.
-                if len(output_text.strip()) < 150 and worker_state["error"]:
+                if len(output_text.strip()) < 50:
                     try:
                         for token in stream_nvidia(
                             api_key=leased_key,
