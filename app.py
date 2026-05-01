@@ -25,7 +25,7 @@ HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "2500"))
 DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "800"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.85"))
-STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "280"))
+STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "300"))
 REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "10"))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -115,6 +115,7 @@ SYSTEM_PROMPT = """
 Ты — персонаж в ролевом чате.
 Правила:
 - всегда пиши живо, эмоционально
+- соблюдай литературный стиль при описании действий и эмоций
 - используй действия в *звёздочках*
 - добавляй реакции, чувства, атмосферу
 - не пиши как ИИ
