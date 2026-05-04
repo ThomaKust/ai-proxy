@@ -17,7 +17,7 @@ FAST_MODEL = os.getenv("FAST_MODEL", "meta/llama-3.1-8b-instruct")
 MAIN_MODEL = os.getenv("MAIN_MODEL", "deepseek-ai/deepseek-v4-flash")
 
 # Tuneable limits via Render env vars.
-MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "600"))
+MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "800"))
 PROMPT_HISTORY_MESSAGES = int(os.getenv("PROMPT_HISTORY_MESSAGES", "80"))
 MIN_OUTPUT_CHARS = int(os.getenv("MIN_OUTPUT_CHARS", "3500"))
 MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "6"))
@@ -25,8 +25,8 @@ HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "2500"))
 DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "800"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.85"))
-STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "320"))
-REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "20"))
+STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "340"))
+REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "15"))
 
 BASE_DIR = Path(__file__).resolve().parent
 MEMORY_FILE = BASE_DIR / "memory.json"
