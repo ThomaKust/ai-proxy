@@ -296,13 +296,20 @@ def stream_nvidia(api_key, model, messages, temperature, max_tokens, read_timeou
                 body = resp.text
             except Exception:
                 body = ""
-            raise RuntimeError(f"{model} HTTP {resp.status_code}: {body[:300]}")
 
-        for raw_line in resp.iter_lines(decode_unicode=True, chunk_size=1):
+            raise RuntimeError(
+                f"{model} HTTP {resp.status_code}: {body[:300]}"
+            )
+
+        for raw_line in resp.iter_lines(
+            decode_unicode=True,
+            chunk_size=1
+        ):
             if raw_line is None:
                 continue
 
             line = raw_line.strip()
+
             if not line:
                 continue
 
@@ -318,11 +325,14 @@ def stream_nvidia(api_key, model, messages, temperature, max_tokens, read_timeou
                 continue
 
             choices = data.get("choices") or []
+
             if not choices:
                 continue
 
             delta = choices[0].get("delta") or {}
+
             token = delta.get("content") or ""
+
             if token:
                 yield token
 
@@ -335,21 +345,29 @@ def stream_nvidia(api_key, model, messages, temperature, max_tokens, read_timeou
 
 def estimate_output_target(requested_max_tokens):
     base = max(MIN_OUTPUT_CHARS, requested_max_tokens * 3)
-    return min(base, 8000)
+    return min(base, 12000)
 
 
 def continuation_prompt(current_text):
-    tail = current_text[-500:]
+    tail = current_text[-4000:]
+
     return [
+        {
+            "role": "assistant",
+            "content": tail,
+        },
         {
             "role": "user",
             "content": (
-                "Continue the scene naturally from the last sentence. "
-                "Do not restart, do not summarize, do not repeat earlier text. "
-                "Write at least several more substantial paragraphs."
+                "Continue the roleplay scene immediately from the last sentence. "
+                "Do not summarize. "
+                "Do not finish the scene quickly. "
+                "Write long detailed paragraphs with actions, emotions, atmosphere, body language, dialogue and narration. "
+                "Continue naturally as if the story is still actively happening. "
+                "Avoid short replies. "
+                "Write a substantial continuation."
             ),
         },
-        {"role": "assistant", "content": tail},
     ]
 
 
@@ -357,15 +375,24 @@ def append_memory_turns(user_messages, assistant_text):
     with memory_lock:
         if user_messages:
             last_user = user_messages[-1]
-            if isinstance(last_user, dict) and last_user.get("role") == "user":
+
+            if (
+                isinstance(last_user, dict)
+                and last_user.get("role") == "user"
+            ):
                 memory.append({
                     "role": "user",
                     "content": last_user.get("content", ""),
                 })
 
-        memory.append({"role": "assistant", "content": assistant_text})
-        memory[:] = safe_message_list(memory)[-MAX_MEMORY_MESSAGES:]
+        memory.append({
+            "role": "assistant",
+            "content": assistant_text
+        })
 
+        memory[:] = safe_message_list(
+            memory
+        )[-MAX_MEMORY_MESSAGES:]
 
 # ---------------- ROUTE ----------------
 
@@ -486,13 +513,21 @@ def chat():
 
                 # Continuation rounds until answer is long enough.
                 continuation_round = 0
-                while len(output_text.strip()) < target_chars and continuation_round < MAX_CONTINUATION_ROUNDS:
+
+                while (
+                    len(output_text.strip()) < target_chars
+                    and continuation_round < MAX_CONTINUATION_ROUNDS
+                ):
                     continuation_round += 1
 
-                    cont_messages = prompt_messages + [
-                        {"role": "assistant", "content": output_text},
-                        {"role": "user", "content": "Continue naturally. Do not repeat. Extend the scene."},
-                    ]
+                    # 🔥 добавляем разделение перед продолжением
+                    output_text += "\n\n"
+
+                    # 🔥 continuation через хвост текста
+                    cont_messages = (
+                        prompt_messages
+                        + continuation_prompt(output_text)
+                    )
 
                     try:
                         for token in stream_nvidia(
@@ -503,11 +538,18 @@ def chat():
                             max_tokens=continuation_max_tokens,
                         ):
                             output_text += token
-                            yield sse(make_chunk(token, model_name=MAIN_MODEL))
+
+                            yield sse(
+                                make_chunk(
+                                    token,
+                                    model_name=MAIN_MODEL
+                                )
+                            )
 
                             if time.time() - last_ping >= HEARTBEAT_SECONDS:
                                 yield "data: {}\n\n"
                                 last_ping = time.time()
+
                     except Exception as cont_error:
                         print("CONTINUATION ERROR:", str(cont_error))
                         break
