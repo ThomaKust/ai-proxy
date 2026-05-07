@@ -13,8 +13,8 @@ CORS(app)
 
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-FAST_MODEL = os.getenv("FAST_MODEL", "meta/llama-3.1-8b-instruct")
-MAIN_MODEL = os.getenv("MAIN_MODEL", "deepseek-ai/deepseek-v4-flash")
+FAST_MODEL = os.getenv("FAST_MODEL", "z-ai/glm-4.7")
+MAIN_MODEL = os.getenv("MAIN_MODEL", "moonshotai/kimi-k2-instruct-0905")
 
 # Tuneable limits via Render env vars.
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "800"))
@@ -25,7 +25,7 @@ HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "2500"))
 DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "800"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.85"))
-STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "440"))
+STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "340"))
 REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "15"))
 
 BASE_DIR = Path(__file__).resolve().parent
