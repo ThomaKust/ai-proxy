@@ -20,10 +20,10 @@ MAIN_MODEL = os.getenv("MAIN_MODEL", "mistralai/mistral-large-3-675b-instruct-25
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "800"))
 PROMPT_HISTORY_MESSAGES = int(os.getenv("PROMPT_HISTORY_MESSAGES", "100"))
 MIN_OUTPUT_CHARS = int(os.getenv("MIN_OUTPUT_CHARS", "4500"))
-MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "8"))
+MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "12"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "3500"))
-DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "1800"))
+DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "2200"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.87"))
 STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "280"))
 REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "15"))
@@ -139,6 +139,11 @@ Add sudden actions and elements of surprise to the narrative.
 Always write a substantial reply.
 Prefer a detailed answer over a short one.
 If the scene is not finished, continue it instead of ending early.
+- never end scenes quickly
+- avoid short conclusions
+- continue interactions naturally
+- responses should feel ongoing and immersive
+- do not wrap up scenes unless explicitly required
 """.strip()
 
 
