@@ -19,7 +19,7 @@ MAIN_MODEL = os.getenv("MAIN_MODEL", "mistralai/mistral-large-3-675b-instruct-25
 # Tuneable limits via Render env vars.
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "800"))
 PROMPT_HISTORY_MESSAGES = int(os.getenv("PROMPT_HISTORY_MESSAGES", "100"))
-MIN_OUTPUT_CHARS = int(os.getenv("MIN_OUTPUT_CHARS", "6000"))
+MIN_OUTPUT_CHARS = int(os.getenv("MIN_OUTPUT_CHARS", "4500"))
 MAX_CONTINUATION_ROUNDS = int(os.getenv("MAX_CONTINUATION_ROUNDS", "8"))
 HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "3500"))
