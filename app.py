@@ -14,7 +14,7 @@ CORS(app)
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 FAST_MODEL = os.getenv("FAST_MODEL", "stepfun-ai/step-3.5-flash")
-MAIN_MODEL = os.getenv("MAIN_MODEL", "deepseek-ai/deepseek-v4-pro")
+MAIN_MODEL = os.getenv("MAIN_MODEL", "deepseek-ai/deepseek-v4-flash")
 
 # Tuneable limits via Render env vars.
 MAX_MEMORY_MESSAGES = int(os.getenv("MAX_MEMORY_MESSAGES", "800"))
@@ -25,7 +25,7 @@ HEARTBEAT_SECONDS = int(os.getenv("HEARTBEAT_SECONDS", "5"))
 DEFAULT_MAX_TOKENS = int(os.getenv("DEFAULT_MAX_TOKENS", "3500"))
 DEFAULT_CONTINUATION_TOKENS = int(os.getenv("DEFAULT_CONTINUATION_TOKENS", "2200"))
 DEFAULT_TEMPERATURE = float(os.getenv("DEFAULT_TEMPERATURE", "0.87"))
-STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "580"))
+STREAM_READ_TIMEOUT = int(os.getenv("STREAM_READ_TIMEOUT", "600"))
 REQUEST_CONNECT_TIMEOUT = int(os.getenv("REQUEST_CONNECT_TIMEOUT", "15"))
 
 BASE_DIR = Path(__file__).resolve().parent
