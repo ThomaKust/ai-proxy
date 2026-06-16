@@ -13,7 +13,7 @@ CORS(app)
 
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-FAST_MODEL = os.getenv("FAST_MODEL", "stepfun-ai/step-3.5-flash")
+FAST_MODEL = os.getenv("FAST_MODEL", "deepseek-ai/deepseek-v4-pro")
 MAIN_MODEL = os.getenv("MAIN_MODEL", "deepseek-ai/deepseek-v4-flash")
 
 # Tuneable limits via Render env vars.
@@ -499,7 +499,7 @@ def chat():
                             break
 
                 # Silent fallback to fast model if main model produced almost nothing.
-                if len(output_text.strip()) < 50 and worker_state["error"]:
+                if len(output_text.strip()) < 200:
                     try:
                         for token in stream_nvidia(
                             api_key=leased_key,
@@ -514,8 +514,9 @@ def chat():
                             if time.time() - last_ping >= HEARTBEAT_SECONDS:
                                 yield "data: {}\n\n"
                                 last_ping = time.time()
-                    except Exception as fast_error:
-                        print("FAST STREAM ERROR:", str(fast_error))
+                    except Exception as e:
+                        worker_state["error"] = str(e)
+                        print("MAIN STREAM ERROR:", str(e))
 
                 # Continuation rounds until answer is long enough.
                 continuation_round = 0
