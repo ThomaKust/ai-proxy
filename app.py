@@ -499,8 +499,17 @@ def chat():
                             break
 
                 # Silent fallback to fast model if main model produced almost nothing.
-                if len(output_text.strip()) < 200:
+                if (
+                    len(output_text.strip()) < 200
+                    or (
+                        worker_state["error"]
+                        and "429" in str(worker_state["error"])
+                    )
+                ):
+                    
                     try:
+                        time.sleep(2)
+                        
                         for token in stream_nvidia(
                             api_key=leased_key,
                             model=FAST_MODEL,
@@ -514,9 +523,10 @@ def chat():
                             if time.time() - last_ping >= HEARTBEAT_SECONDS:
                                 yield "data: {}\n\n"
                                 last_ping = time.time()
-                    except Exception as e:
-                        worker_state["error"] = str(e)
-                        print("MAIN STREAM ERROR:", str(e))
+                    except Exception as fast_error:
+                        print("FAST STREAM ERROR:", str(fast_error))
+                        print("MAIN ERROR:", worker_state["error"])
+                        print("OUTPUT LENGTH:", len(output_text))
 
                 # Continuation rounds until answer is long enough.
                 continuation_round = 0
